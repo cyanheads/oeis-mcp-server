@@ -1,0 +1,25 @@
+{
+  "name": "oeis-mcp-server",
+  "version": "0.1.0",
+  "description": "Search the On-Line Encyclopedia of Integer Sequences (OEIS): identify sequences by terms, A-number, formulas, and cross-references.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/oeis-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/oeis-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "oeis", "integer-sequences", "mathematics", "number-theory", "combinatorics"],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "oeis-mcp-server",
+    "shortDescription": "Look up and identify integer sequences in the OEIS.",
+    "longDescription": "Search the On-Line Encyclopedia of Integer Sequences from your agent. Identify an unknown sequence from a list of observed terms, look up a sequence by A-number, and read its formulas, generating functions, code, and offsets. Follow cross-references to related sequences and transforms. Every record links back to its OEIS page.",
+    "developerName": "cyanheads",
+    "category": "reference",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/oeis-mcp-server",
+    "defaultPrompt": []
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "oeis-mcp-server",
+  "version": "0.1.0",
+  "description": "Search the On-Line Encyclopedia of Integer Sequences (OEIS): identify sequences by terms, A-number, formulas, and cross-references.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/oeis-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/oeis-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "oeis", "integer-sequences", "mathematics", "number-theory", "combinatorics"],
+  "mcpServers": {
+    "oeis-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/oeis-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
