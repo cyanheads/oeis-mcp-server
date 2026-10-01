@@ -2,7 +2,7 @@
   "name": "@cyanheads/oeis-mcp-server",
   "version": "0.1.0",
   "mcpName": "io.github.cyanheads/oeis-mcp-server",
-  "description": "Search the On-Line Encyclopedia of Integer Sequences (OEIS): identify sequences by terms, A-number, formulas, and cross-references.",
+  "description": "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs via MCP. STDIO or Streamable HTTP.",
   "author": "Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)",
   "funding": [
     {
@@ -48,13 +48,29 @@
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",
     "release:github": "bun run scripts/release-github.ts",
+    "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "start": "node dist/index.js",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
     "start:http": "MCP_TRANSPORT_TYPE=http node dist/index.js"
   },
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "oeis",
+    "integer-sequences",
+    "sequence-identification",
+    "mathematics",
+    "number-theory",
+    "combinatorics",
+    "generating-functions"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cyanheads/oeis-mcp-server.git"

@@ -9,18 +9,33 @@
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
+> **Read the design next:** `docs/design.md` records the tool surface, the shared input and output shapes, the upstream API behavior verified against oeis.org, the resilience table (pacing, retries, caching), and the design decisions. Update it when the surface or a decision changes.
+
 ---
 
-## First Session
+## Domain
 
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
+Six read-only tools and one resource over oeis.org, the On-Line Encyclopedia of Integer Sequences. Keyless; OEIS content is CC BY-SA 4.0.
 
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
+| Upstream path | Format | Used by |
+|:--------------|:-------|:--------|
+| `/A######?fmt=json` | One record as JSON | `oeis_get_sequence`, `oeis://sequence/{aNumber}`, `oeis_get_cross_refs` outgoing, `oeis_get_terms` when the entry has no b-file |
+| `/search?q=…&fmt=text` | Internal format, 10 records per page | `oeis_identify_sequence`, `oeis_search_sequences`, `oeis_get_cross_refs` (outgoing names, incoming) |
+| `/A######/b######.txt` | b-file, first 1 MiB read | `oeis_get_terms` |
 
-1. **Get your bearings.** Take stock of the project tree, the skills in `framework-skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `framework-skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `framework-skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
+`oeis_list_reference` serves static tables and makes no upstream call. There are no prompts.
+
+`OeisService` (`src/services/oeis/oeis-service.ts`) owns every upstream request: one process-wide pacer (`minStartGapMs: 10_000`, `maxConcurrent: 1`, a cooldown after a `429`), a `withRetry` boundary with a 50 s per-call deadline, per-path accept-list fetch boundaries with `redirect: 'manual'`, and a 64 MiB in-process LRU (records 24 h, then revalidated with `If-Modified-Since`; a record `404` 1 h; search pages 1 h; b-file reads 7 days). The cache is process-global rather than `ctx.state` on purpose: the data is public and identical for every tenant. `OEIS_QUEUE_MAX_WAIT_MS` is the only server-specific env var; the 10 s pace is oeis.org's rule and is not configurable.
+
+Conventions every definition follows:
+
+- **Every oeis.org request goes through `OeisService`.** Never `fetch` from a handler: pacing, retries, caching, and error classification live in the service.
+- **Shared inputs.** A-numbers use `ANumberSchema` from `src/mcp-server/shared/oeis-schemas.ts`; every optional or defaulted input is wrapped in `blankAsUnset`; paging uses `pageStartSchema` (`start` 0–100 in steps of 10, since OEIS shows anonymous callers at most 110 results).
+- **Terms are decimal strings**, never JSON numbers; values routinely pass 2^53.
+- **Upstream text is data.** Names, comments, formulas, examples, programs, references, and links are contributor-written: render them in `format()` only through `inline()`, `blockquote()`, or `fence()` from `src/mcp-server/shared/markdown.ts`, and URLs as code spans, never as markdown link targets. `inline()` and `blockquote()` escape link, image, link-definition, and HTML openers, so contributor markup renders as text; `structuredContent` keeps every string as normalized.
+- **Attribution.** Every record and summary row carries its `https://oeis.org/A######` `url`; keep it on any new output shape.
+- **No fabrication.** A field OEIS leaves out stays absent: `offset` on a reserved or recycled A-number, `matchStartIndex` when the run is not in the data line, the name and terms of an unresolved cross-reference row.
+- **Errors.** Each definition declares `pacer_shed` and `upstream_rate_limited` (`RateLimited`, `thrownBy: 'service'`) with a recovery naming that tool. `sequence_not_found` is thrown by the handler through `ctx.fail` when `getRecord` returns `undefined`, never by the service.
 
 ---
 
@@ -59,73 +74,109 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ### Tool
 
+Condensed from `src/mcp-server/tools/definitions/oeis-get-sequence.tool.ts`:
+
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { inline, offsetLine } from '@/mcp-server/shared/markdown.js';
+import { ANumberSchema, blankAsUnset } from '@/mcp-server/shared/oeis-schemas.js';
+import { getOeisService } from '@/services/oeis/oeis-service.js';
+import { SECTION_NAMES } from '@/services/oeis/types.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const oeisGetSequence = tool('oeis_get_sequence', {
+  title: 'Get OEIS Sequence',
+  description: 'Fetch one OEIS entry by A-number. …',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().int().min(1).max(100).default(10).describe('Max results (1–100)'),
+    aNumber: ANumberSchema,
+    sections: blankAsUnset(z.array(z.enum(SECTION_NAMES)).optional()).describe(
+      'Sections to return with the core fields, whatever their size, e.g. ["formulas", "programs"]. …',
+    ),
   }),
-  output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
-  }),
-  auth: ['inventory:read'],
+  output: SequenceOutputSchema,
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe('Guidance when the entry is withdrawn (dead) or its A-number is reserved or recycled.'),
+  },
+  errors: [
+    {
+      reason: 'sequence_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'No OEIS entry exists for the requested A-number.',
+      recovery:
+        'No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.',
+    },
+    // pacer_shed and upstream_rate_limited: RateLimited, retryable, thrownBy: 'service'
+  ],
 
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const record = await getOeisService().getRecord(input.aNumber, ctx);
+    if (!record) {
+      throw ctx.fail('sequence_not_found', `OEIS has no entry ${input.aNumber}.`, {
+        aNumber: input.aNumber,
+      });
+    }
+    const notice = lifecycleNotice(record.keywords);
+    if (notice) ctx.enrich.notice(notice);
+    return buildSequenceOutput(record, { outline: true, sections: input.sections });
   },
 
   // format() populates content[] — the markdown twin of structuredContent.
   // Different clients read different surfaces (Claude Code → structuredContent,
   // Claude Desktop → content[]); both must carry the same data.
   // Enforced at lint time: every field in `output` must appear in the rendered text.
-  format: (result) => [{
-    type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
-  }],
+  format: (result) => {
+    const lines = [
+      `# ${result.aNumber}: ${inline(result.name)}`,
+      offsetLine(result.offset, result.firstIndex),
+      // … every other field, rendered on presence; contributor text through inline/blockquote/fence
+    ];
+    return [{ type: 'text', text: lines.join('\n') }];
+  },
 });
 ```
 
 ### Resource
 
+From `src/mcp-server/resources/definitions/oeis-sequence.resource.ts`:
+
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { ANumberSchema } from '@/mcp-server/shared/oeis-schemas.js';
+import { buildSequenceOutput } from '@/mcp-server/tools/definitions/oeis-get-sequence.tool.js';
+import { getOeisService } from '@/services/oeis/oeis-service.js';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
-  async handler(params, ctx) {
-    const item = await ctx.state.get(`item/${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
-  },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
-  }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
+export const oeisSequenceResource = resource('oeis://sequence/{aNumber}', {
+  name: 'oeis_sequence',
+  title: 'OEIS Sequence',
+  description: 'One OEIS entry by A-number as JSON: … always whole.',
+  mimeType: 'application/json',
+  params: z.object({ aNumber: ANumberSchema }),
+  cacheHint: { ttlMs: 3_600_000, cacheScope: 'public' },
+  errors: [
+    {
+      reason: 'sequence_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'No OEIS entry exists for the requested A-number.',
+      recovery:
+        'No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.',
+    },
+    // pacer_shed and upstream_rate_limited, recoveries ending "then read this resource again."
   ],
+
+  async handler(params, ctx) {
+    const record = await getOeisService().getRecord(params.aNumber, ctx);
+    if (!record) {
+      throw ctx.fail('sequence_not_found', `OEIS has no entry ${params.aNumber}.`, {
+        aNumber: params.aNumber,
+      });
+    }
+    return buildSequenceOutput(record, { outline: false });
+  },
 });
 ```
 
@@ -137,77 +188,78 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
-  verboseLogging: z.stringbool().default(false).describe('Enable verbose logging'),
+  queueMaxWaitMs: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .default(30_000)
+    .describe(
+      'Longest a call waits in the oeis.org request queue before failing with RateLimited and retryAfter.',
+    ),
 });
 
-let _config: z.infer<typeof ServerConfigSchema> | undefined;
-export function getServerConfig() {
+export type ServerConfig = z.infer<typeof ServerConfigSchema>;
+
+let _config: ServerConfig | undefined;
+
+export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
-    verboseLogging: 'MY_VERBOSE_LOGGING',
+    queueMaxWaitMs: 'OEIS_QUEUE_MAX_WAIT_MS',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`MY_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`OEIS_QUEUE_MAX_WAIT_MS`) not the path (`queueMaxWaitMs`). Throws `ConfigurationError`, which the framework prints as a clean startup banner. An empty value and a whole-value `${…}` placeholder (what an MCPB or plugin host forwards when a user leaves an option blank) read as unset, so the default applies.
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
-### Server identity and instructions
+**Adding an env var** means the schema here plus `.env.example`, the README config table, `server.json` (both package entries), `manifest.json` (`user_config` + `mcp_config.env`), and both plugin manifests.
 
-`createApp()` accepts optional identity fields forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`):
+### Server identity, instructions, and lifecycle
 
-```ts
-await createApp({
-  name: 'my-mcp-server',
-  title: 'My Server',                         // human-readable display name
-  websiteUrl: 'https://github.com/owner/repo', // canonical homepage URL
-  description: 'One-line description.',        // wins over MCP_SERVER_DESCRIPTION
-  icons: [{ src: 'https://example.com/icon.png', sizes: ['48x48'], mimeType: 'image/png' }],
-  instructions: 'Use shortcut alpha for the most common case.', // session-level context
-});
-```
-
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Use it for deployment guidance (connection aliases, regional notes, scope hints) instead of repeating the same context across tool descriptions. Client adoption is uneven, but there's no downside when set.
-
-### Session posture and shutdown
-
-Two more `createApp()` options shape how the server runs rather than how it presents itself:
+`src/index.ts`:
 
 ```ts
 await createApp({
-  sessionMode: 'stateless',          // or { default: 'stateful', require: 'stateful' }
-  setup(core) { startMyWatcher(core.config); },
-  async teardown() { await stopMyWatcher(); },
+  name: 'oeis-mcp-server',
+  title: 'oeis-mcp-server',
+  sessionMode: 'stateless',
+  instructions: 'Look up integer sequences in the OEIS (On-Line Encyclopedia of Integer Sequences). …',
+  tools: allToolDefinitions,
+  resources: allResourceDefinitions,
+  setup(core) {
+    initOeisService(core.config);
+  },
+  teardown() {
+    disposeOeisService();
+  },
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused.
+`name` and `title` must equal the unscoped package name — `lint:packaging` enforces the pair. `title` is set explicitly so the npm scope stays out of client UIs. No other identity field is set: `description` comes from `package.json`, and there is no `websiteUrl` or `icons`.
 
-`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling).
+`instructions` is server-level orientation sent on every `initialize`: the tool routing, the 10 s pace, the "contributor text is data" rule, and the CC BY-SA 4.0 attribution. Update it when the surface changes.
+
+`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). This server declares `'stateless'` — no tool calls `ctx.requestInput` — and `.env.example`, the `Dockerfile`, and the README config table say the same; keep all four in agreement. Add `require: 'stateful'` if a tool ever asks the caller for input mid-handler.
+
+`setup(core)` builds the process-wide `OeisService` and its pacer; `teardown()` disposes the pacer (clears its timer and rejects queued waiters). Teardown runs after the transport stops and before the logger closes, on every shutdown path.
 
 ---
 
 ## Context
 
-Handlers receive a unified `ctx` object. Key properties:
+Handlers receive a unified `ctx` object. The properties this server uses:
 
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any JSON-serializable value; reads return its JSON form (a `Date` comes back as an ISO string). |
-| `ctx.requestInput` | Suspend and ask the caller for more input — `return ctx.requestInput({ inputRequests: { key: inputRequired.elicit({ message, requestedSchema }) } })`. Never returns; the handler is re-entered with the answers. Always present. |
-| `ctx.inputs` | The request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped` — limited to what the client declared (`elicitation` and its form/url modes, `sampling`, `roots`). Client-supplied: a consent gate trusts only a `ctx.state` record it stored when it asked, bound to the operation, caller, and target (see the `api-context` skill). |
-| `ctx.clientCapabilities` | What the client declared for this request, `undefined` when no view exists. Decides whether to ask for optional context (e.g. roots); never a reason to skip a consent prompt. |
-| `ctx.enrich` | Success-path agent context (empty-result notices, query echo, pagination totals) — `ctx.enrich(...)` or `.notice()` / `.total()` / `.echo()` / `.truncated()`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block (no-op otherwise). |
-| `ctx.content` | Non-text content blocks — `.image(data, mimeType)`, `.audio(data, mimeType)`, or `ctx.content(block)` for a raw block. Prepended to `content[]` after `format()`; never enters `structuredContent`. |
-| `ctx.signal` | `AbortSignal` for cancellation. |
+| `ctx.enrich` | Success-path agent context — `ctx.enrich(...)` or `.notice()` / `.total()` / `.echo()` / `.truncated()`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block (no-op otherwise). The paged-list tools write `{ truncated: false, shown: 0, cap }` as their first statement so every success path carries the required fields. |
+| `ctx.fail` | Builds the declared contract error for a `reason`, for the handler to throw — `throw ctx.fail('sequence_not_found', message, data)`. |
+| `ctx.signal` | `AbortSignal` for cancellation. The service passes it to `withRetry`; `oeis_get_cross_refs` rethrows instead of degrading when it fired. |
 | `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
-| `ctx.tenantId` | Tenant ID from JWT; `'default'` for stdio or HTTP with auth off. |
+
+The rest of the Context surface (`ctx.state`, `ctx.requestInput`, `ctx.inputs`, `ctx.content`, …) is documented in the framework CLAUDE.md.
 
 ---
 
@@ -221,14 +273,14 @@ Handlers throw — the framework catches, classifies, and formats.
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
 errors: [
-  { reason: 'no_match', code: JsonRpcErrorCode.NotFound,
-    when: 'No item matched the query',
-    recovery: 'Broaden the query or check the spelling and try again.' },
+  { reason: 'sequence_not_found', code: JsonRpcErrorCode.NotFound,
+    when: 'No OEIS entry exists for the requested A-number.',
+    recovery: 'No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.' },
 ],
 async handler(input, ctx) {
-  const item = await db.find(input.id);
-  if (!item) throw ctx.fail('no_match', `No item ${input.id}`);
-  return item;
+  const record = await getOeisService().getRecord(input.aNumber, ctx);
+  if (!record) throw ctx.fail('sequence_not_found', `OEIS has no entry ${input.aNumber}.`);
+  return buildSequenceOutput(record, { outline: true, sections: input.sections });
 }
 ```
 
@@ -259,20 +311,34 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 
 ```text
 src/
-  index.ts                              # createApp() entry point
+  index.ts                                # createApp() entry point, server instructions
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                      # OEIS_QUEUE_MAX_WAIT_MS (Zod schema)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    oeis/
+      oeis-service.ts                     # oeis.org client: pacer, retry, fetch boundaries, LRU cache
+      internal-format.ts                  # Parser for /search?fmt=text pages
+      normalize-record.ts                 # JSON record → normalized SequenceRecord
+      lru-cache.ts                        # Byte-budgeted LRU
+      types.ts                            # Domain types, SECTION_NAMES
   mcp-server/
+    shared/
+      oeis-schemas.ts                     # ANumberSchema, blankAsUnset, pageStartSchema, SequenceSummarySchema
+      markdown.ts                         # inline / blockquote / fence helpers for contributor text
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+      index.ts                            # allToolDefinitions barrel
+      oeis-identify-sequence.tool.ts
+      oeis-search-sequences.tool.ts
+      oeis-get-sequence.tool.ts
+      oeis-get-terms.tool.ts
+      oeis-get-cross-refs.tool.ts
+      oeis-list-reference.tool.ts
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      index.ts                            # allResourceDefinitions barrel
+      oeis-sequence.resource.ts           # oeis://sequence/{aNumber}
+tests/                                    # Mirrors src/; fixtures/ holds upstream payloads and fetch fakes
+docs/
+  design.md                               # Tool surface, upstream API reference, design decisions
 ```
 
 ---
@@ -281,10 +347,10 @@ src/
 
 | What | Convention | Example |
 |:-----|:-----------|:--------|
-| Files | kebab-case with suffix | `search-docs.tool.ts` |
-| Tool/resource/prompt names | snake_case | `search_docs` |
-| Directories | kebab-case | `src/services/doc-search/` |
-| Descriptions | Single string or template literal, no `+` concatenation | `'Search items by query and filter.'` |
+| Files | kebab-case with suffix | `oeis-get-terms.tool.ts` |
+| Tool/resource names | snake_case, `oeis_` prefix | `oeis_get_terms` |
+| Directories | kebab-case | `src/services/oeis/` |
+| Descriptions | Single string or template literal, no `+` concatenation | `'List terms a(n) of a sequence with their indices n. …'` |
 
 ---
 
@@ -357,11 +423,14 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run test:coverage` | Run tests with coverage |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
+| `bun run release:github` | Create the GitHub Release from the version's annotated tag and attach the `.mcpb` bundle (run by `release-and-publish`) |
+| `bun run publish-mcp` | Log in to the MCP Registry and publish `server.json` (run by `release-and-publish`) |
 
 **CI is one file.** `.github/workflows/codeql.yml` (scaffolded) is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
@@ -418,7 +487,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
 // Server's own code — via path alias
-import { getMyService } from '@/services/my-domain/my-service.js';
+import { getOeisService } from '@/services/oeis/oeis-service.js';
 ```
 
 ---
@@ -426,17 +495,19 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 ## Checklist
 
 - [ ] Zod schemas: all fields have `.describe()`, only JSON-Schema-serializable types (no `z.custom()`, `z.date()`, `z.transform()`, `z.bigint()`, `z.symbol()`, `z.void()`, `z.map()`, `z.set()`, `z.function()`, `z.nan()`)
-- [ ] Optional nested objects: handler guards for empty inner values from form-based clients (`if (input.obj?.field && ...)`, not just `if (input.obj)`). When regex/length constraints matter, use `z.union([z.literal(''), z.string().regex(...).describe(...)])` — literal variants are exempt from `describe-on-fields`.
+- [ ] Optional and defaulted inputs wrapped in `blankAsUnset`; A-numbers through `ANumberSchema`; paging through `pageStartSchema`
+- [ ] Every oeis.org request goes through `OeisService` (paced, retried, cached); no `fetch` in a handler
+- [ ] Terms and b-file values stay decimal strings; every record and row keeps its `https://oeis.org/A######` `url`
+- [ ] Contributor-written text reaches `format()` only through `inline()` / `blockquote()` / `fence()`; URLs as code spans
+- [ ] `pacer_shed` and `upstream_rate_limited` declared (`thrownBy: 'service'`) with recoveries naming the tool; `sequence_not_found` thrown by the handler via `ctx.fail`
 - [ ] JSDoc `@fileoverview` + `@module` on every file
-- [ ] `ctx.log` for logging, `ctx.state` for storage
-- [ ] Handlers throw on failure — error factories or plain `Error`, no try/catch
+- [ ] `ctx.log` for logging, `ctx.enrich` for notices, totals, and paging context
+- [ ] Handlers throw on failure — error factories or plain `Error`, no try/catch (the cross-references name batch, which degrades to unresolved rows, is the one deliberate exception)
 - [ ] `format()` renders all data the LLM needs — different clients forward different surfaces (Claude Code → `structuredContent`, Claude Desktop → `content[]`); both must carry the same data
-- [ ] If wrapping external API: raw/domain/output schemas reviewed against real upstream sparsity/nullability before finalizing required vs optional fields
-- [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
-- [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
-- [ ] Registered in `createApp()` arrays (directly or via barrel exports)
+- [ ] Raw/domain/output schemas reviewed against real upstream sparsity: a field OEIS leaves out stays absent, never invented
+- [ ] Tests include at least one sparse payload case with omitted upstream fields; upstream responses come from fixtures, never the live site
+- [ ] Registered in `createApp()` arrays via the barrels in `src/mcp-server/*/definitions/index.ts`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
-- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
-- [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
-- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — mirror the `user_config` block in `manifest.json`. Never write `"KEY": ""` into `env`
+- [ ] `docs/design.md` updated when the surface or a design decision changes
+- [ ] New env var added everywhere: `.env.example`, README config table, `server.json` (both entries), `manifest.json`, `.claude-plugin/plugin.json`, `.codex-plugin/mcp.json` `env_vars`
 - [ ] `npm run devcheck` passes

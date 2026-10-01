@@ -2,21 +2,33 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "oeis-mcp-server",
   "version": "0.1.0",
-  "description": "Search the On-Line Encyclopedia of Integer Sequences (OEIS): identify sequences by terms, A-number, formulas, and cross-references.",
+  "description": "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
-    "url": "https://caseyjhand.com"
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/oeis-mcp-server#readme",
   "repository": "https://github.com/cyanheads/oeis-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "oeis", "integer-sequences", "mathematics", "number-theory", "combinatorics"],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "oeis",
+    "integer-sequences",
+    "sequence-identification",
+    "mathematics",
+    "number-theory",
+    "combinatorics",
+    "generating-functions"
+  ],
   "userConfig": {
-    "OEIS_QUEUE_MAX_WAIT_MS": {
+    "oeis_queue_max_wait_ms": {
       "type": "number",
       "title": "Queue wait budget (ms)",
-      "description": "Longest a call waits in the oeis.org request queue (paced to one start per 10 s) before failing with a retry-after. Default 30000.",
+      "description": "Optional. Longest a call waits in the oeis.org request queue (paced to one request every 10 seconds) before failing with a retry-after. Default 30000.",
       "default": 30000
     }
   },
@@ -26,7 +38,7 @@
       "args": ["-y", "@cyanheads/oeis-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
-        "OEIS_QUEUE_MAX_WAIT_MS": "${user_config.OEIS_QUEUE_MAX_WAIT_MS}"
+        "OEIS_QUEUE_MAX_WAIT_MS": "${user_config.oeis_queue_max_wait_ms}"
       }
     }
   }

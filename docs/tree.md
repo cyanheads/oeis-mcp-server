@@ -1,6 +1,6 @@
 # oeis-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 04:36:28
+Generated on: 2026-10-01 05:40:07
 
 ```text
 oeis-mcp-server/
@@ -24,6 +24,7 @@ oeis-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -191,12 +192,14 @@ oeis-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
 ├── package.json
+├── README.md
 ├── server.json
 ├── tsconfig.build.json
 ├── tsconfig.json

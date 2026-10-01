@@ -1,21 +1,33 @@
 {
   "name": "oeis-mcp-server",
   "version": "0.1.0",
-  "description": "Search the On-Line Encyclopedia of Integer Sequences (OEIS): identify sequences by terms, A-number, formulas, and cross-references.",
+  "description": "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
-    "url": "https://caseyjhand.com"
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/oeis-mcp-server#readme",
   "repository": "https://github.com/cyanheads/oeis-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "oeis", "integer-sequences", "mathematics", "number-theory", "combinatorics"],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "oeis",
+    "integer-sequences",
+    "sequence-identification",
+    "mathematics",
+    "number-theory",
+    "combinatorics",
+    "generating-functions"
+  ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "oeis-mcp-server",
-    "shortDescription": "Look up and identify integer sequences in the OEIS.",
-    "longDescription": "Search the On-Line Encyclopedia of Integer Sequences from your agent. Identify an unknown sequence from a list of observed terms, look up a sequence by A-number, and read its formulas, generating functions, code, and offsets. Follow cross-references to related sequences and transforms. Every record links back to its OEIS page.",
+    "shortDescription": "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs.",
+    "longDescription": "Look up integer sequences in the On-Line Encyclopedia of Integer Sequences (OEIS). Identify an unknown sequence from a run of observed terms, with the index where the run begins in each match, or search with OEIS's own query syntax: words, quoted phrases, and prefixes such as keyword:, author:, and formula:. Read an entry by A-number with its formulas, generating functions, programs, comments, and references; pull extended terms from its b-file as exact decimal strings; and list the sequences it cross-references or that mention it. A reference tool decodes keyword flags, search syntax, and offsets. Requests to oeis.org are paced to one every 10 seconds and cached. No API key required; OEIS content is CC BY-SA 4.0, and every record carries its oeis.org URL for attribution.",
     "developerName": "cyanheads",
     "category": "reference",
     "capabilities": ["Read"],
