@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/oeis-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mcpName": "io.github.cyanheads/oeis-mcp-server",
   "description": "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs via MCP. STDIO or Streamable HTTP.",
   "author": "Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)",
