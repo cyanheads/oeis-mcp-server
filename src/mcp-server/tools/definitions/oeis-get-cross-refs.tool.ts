@@ -21,11 +21,14 @@ import type { SequenceSummary } from '@/services/oeis/types.js';
 
 const A_NUMBER = /\bA\d{6,7}(?!\d)/g;
 
-/** Batch-lookup failures that degrade the page to unresolved rows instead of failing the call. */
-const DEGRADING_CODES: ReadonlySet<JsonRpcErrorCode> = new Set([
-  JsonRpcErrorCode.RateLimited,
-  JsonRpcErrorCode.ServiceUnavailable,
-  JsonRpcErrorCode.Timeout,
+/**
+ * Batch-lookup failures that degrade the page to unresolved rows instead of failing the call, each
+ * with the reason code the notice names when the error carries none.
+ */
+const DEGRADING_CODES: ReadonlyMap<JsonRpcErrorCode, string> = new Map([
+  [JsonRpcErrorCode.RateLimited, 'rate_limited'],
+  [JsonRpcErrorCode.ServiceUnavailable, 'upstream_unavailable'],
+  [JsonRpcErrorCode.Timeout, 'upstream_timeout'],
 ]);
 
 const DEFAULT_RETRY_AFTER_SECONDS = 10;
@@ -43,17 +46,26 @@ type NameResolution =
   | { kind: 'resolved'; rows: Map<string, SequenceSummary> }
   | { kind: 'degraded'; failure: string; retryAfterSeconds: number };
 
+/** The index of the `)` that balances each `(` in the line; an unclosed `(` has no entry. */
+function closingParens(line: string): Map<number, number> {
+  const closes = new Map<number, number>();
+  const open: number[] = [];
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '(') open.push(i);
+    else if (line[i] === ')') {
+      const at = open.pop();
+      if (at !== undefined) closes.set(at, i);
+    }
+  }
+  return closes;
+}
+
 /** The parenthetical immediately after position `at` (spaces skipped, nesting balanced), if any. */
-function noteAt(line: string, at: number): string | undefined {
+function noteAt(line: string, at: number, closes: ReadonlyMap<number, number>): string | undefined {
   let open = at;
   while (line[open] === ' ') open++;
-  if (line[open] !== '(') return;
-  let depth = 0;
-  for (let i = open; i < line.length; i++) {
-    if (line[i] === '(') depth++;
-    else if (line[i] === ')' && --depth === 0) return line.slice(open + 1, i).trim() || undefined;
-  }
-  return;
+  const close = closes.get(open);
+  return close === undefined ? undefined : line.slice(open + 1, close).trim() || undefined;
 }
 
 /**
@@ -63,10 +75,11 @@ function noteAt(line: string, at: number): string | undefined {
 function outgoingRefs(aNumber: string, lines: readonly string[]): OutgoingRef[] {
   const refs = new Map<string, OutgoingRef>();
   lines.forEach((line, lineIndex) => {
+    const closes = closingParens(line);
     for (const match of line.matchAll(A_NUMBER)) {
       const ref = match[0];
       if (ref === aNumber) continue;
-      const note = noteAt(line, match.index + ref.length);
+      const note = noteAt(line, match.index + ref.length, closes);
       const known = refs.get(ref);
       if (!known) refs.set(ref, { aNumber: ref, lineIndex, ...(note && { note }) });
       else if (note && !known.note) known.note = note;
@@ -83,8 +96,9 @@ function retryAfterSeconds(err: McpError): number {
 
 /**
  * Resolves one page of A-numbers to names and terms with a single `id:…|id:…` search. Once the
- * service's retries are spent, a rate limit, outage, or timeout degrades to unresolved rows; a
- * cancelled request and any other failure rethrow.
+ * service's retries are spent, a rate limit, outage, or timeout degrades to unresolved rows named
+ * by a reason code, never by the error's message; a cancelled request and any other failure
+ * rethrow.
  */
 async function resolveNames(
   refs: readonly OutgoingRef[],
@@ -99,10 +113,10 @@ async function resolveNames(
     );
     return { kind: 'resolved', rows: new Map(page.rows.map((row) => [row.aNumber, row])) };
   } catch (err) {
-    if (ctx.signal.aborted || !(err instanceof McpError) || !DEGRADING_CODES.has(err.code)) {
-      throw err;
-    }
-    const reason = typeof err.data?.reason === 'string' ? err.data.reason : err.message;
+    if (ctx.signal.aborted || !(err instanceof McpError)) throw err;
+    const fallback = DEGRADING_CODES.get(err.code);
+    if (fallback === undefined) throw err;
+    const reason = typeof err.data?.reason === 'string' ? err.data.reason : fallback;
     ctx.log.warning('Cross-reference name lookup failed; returning unresolved rows', {
       code: err.code,
       reason,

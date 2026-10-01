@@ -1,6 +1,7 @@
 /**
  * @fileoverview Tests for record normalization: Zod validation failures, absent sections as `[]`,
- * the Maple / Mathematica / `(Lang)` program split, link decoding, and `bFileUrl`.
+ * the Maple / Mathematica / `(Lang)` program split, link decoding, `bFileUrl`, and linear-time
+ * parsing of long contributor lines.
  * @module tests/services/oeis/normalize-record.test
  */
 
@@ -153,6 +154,12 @@ describe('normalizeRecord', () => {
       const error = normalizeError(recordWith({ offset }));
       expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
       expect(error.message).toContain('A000045');
+    });
+
+    it('keeps an unreadable offset out of the message', () => {
+      const error = normalizeError(recordWith({ offset: 'see <a href="x">here</a>' }));
+      expect(error.message).toBe('OEIS returned A000045 with an unreadable offset.');
+      expect(JSON.stringify(error.data)).not.toContain('here');
     });
   });
 
@@ -330,6 +337,13 @@ describe('normalizeRecord', () => {
       expect(link?.urls).toEqual([]);
     });
 
+    it('reads an href only inside the anchor tag that carries it', () => {
+      const [link] = normalizeRecord(
+        recordWith({ link: ['<a x <img href="https://example.org/i.png">image</a>'] }),
+      ).links;
+      expect(link?.urls).toEqual([]);
+    });
+
     describe('URL schemes', () => {
       const linkOf = (line: string) => normalizeRecord(recordWith({ link: [line] })).links[0];
 
@@ -478,6 +492,28 @@ describe('normalizeRecord', () => {
         recordWith({ link: ['&lt;a href=&quot;javascript:x&quot;&gt;Evil&lt;/a&gt;'] }),
       ).links;
       expect(link?.text).toBe('<a>Evil</a>');
+    });
+
+    it('removes the whole whitespace run before a dropped href', () => {
+      const comment = ['<a \t href="javascript:x" title="t">A000032</a>'];
+      expect(normalizeRecord(recordWith({ comment })).comments).toEqual([
+        '<a title="t">A000032</a>',
+      ]);
+    });
+  });
+
+  describe('long contributor lines', () => {
+    const MIB = 1024 * 1024;
+
+    it.each([
+      ['a whitespace run in a comment', { comment: [`${' '.repeat(MIB - 1)}x`] }],
+      ['a run of "<" in a link line', { link: ['<'.repeat(MIB)] }],
+      ['a run of "<a " in a link line', { link: ['<a '.repeat(MIB / 4)] }],
+    ])('normalizes 1 MiB of %s in linear time', (_shape, override) => {
+      const raw = recordWith(override);
+      const started = performance.now();
+      normalizeRecord(raw);
+      expect(performance.now() - started).toBeLessThan(250);
     });
   });
 });

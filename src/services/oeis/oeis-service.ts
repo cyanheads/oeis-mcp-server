@@ -23,7 +23,7 @@ import {
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { parseSearchText } from './internal-format.js';
-import { LruCache } from './lru-cache.js';
+import { heapCharge, LruCache } from './lru-cache.js';
 import { normalizeRecord } from './normalize-record.js';
 import type {
   BFileRead,
@@ -40,8 +40,16 @@ export const DEFAULT_DEADLINE_MS = 50_000;
 const PER_ATTEMPT_MS = 15_000;
 const DEFAULT_QUEUE_MAX_WAIT_MS = 30_000;
 const BFILE_MAX_BYTES = 1_048_576;
+/** Ceiling on a record body; A000108, among the largest entries, is 134 KB as served. */
+const RECORD_MAX_BYTES = 4 * 1_048_576;
+/** Ceiling on a search page; the heaviest measured page of 10 full records was 264 KB. */
+const SEARCH_MAX_BYTES = 16 * 1_048_576;
+/** Ceiling on a `/search` 403 body; the sign-in refusal is one short line. */
+const REFUSAL_MAX_BYTES = 65_536;
 const CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const RECORD_TTL_MS = 24 * 60 * 60 * 1000;
+/** How long a `404` for an A-number is remembered. */
+const MISSING_TTL_MS = 60 * 60 * 1000;
 const SEARCH_TTL_MS = 60 * 60 * 1000;
 const BFILE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BFILE_LINE = /^\s*(-?\d+)\s+(-?\d+)\s*$/;
@@ -55,8 +63,12 @@ const DEFAULT_USER_AGENT = 'oeis-mcp-server (+https://github.com/cyanheads/oeis-
 
 type CachedValue =
   | { kind: 'record'; record: SequenceRecord; lastModified?: string }
+  | { kind: 'missing' }
   | { kind: 'search'; page: SearchPage }
   | { kind: 'bfile'; read: BFileRead };
+
+/** Cached under a record key while OEIS answers `404` for the A-number. */
+const MISSING: CachedValue = { kind: 'missing' };
 
 type RecordOutcome =
   | { kind: 'ok'; record: SequenceRecord; lastModified?: string }
@@ -119,6 +131,32 @@ async function readCapped(
   return { bytes, overflowed };
 }
 
+/**
+ * Reads a text body of at most `max` bytes. A longer body reads as empty, so each caller sends it
+ * down its unreadable-body path: not a JSON record, no `Search:` line, not the sign-in text.
+ */
+async function readText(res: Response, max: number): Promise<string> {
+  const { bytes, overflowed } = await readCapped(res, max);
+  return overflowed ? '' : new TextDecoder().decode(bytes);
+}
+
+/**
+ * Classifies a status outside a path's accept-list from the status code and headers alone: `429`
+ * → RateLimited with `retryAfter`, `5xx` → ServiceUnavailable, `3xx` → InvalidRequest. The body is
+ * discarded unread and the reason phrase dropped, so the message and data are server-written apart
+ * from the `Retry-After` value.
+ */
+async function unexpectedStatus(res: Response): Promise<McpError> {
+  await discard(res);
+  const { code, data } = await httpErrorFromResponse(res, {
+    service: 'OEIS',
+    captureBody: false,
+    ...(res.status === 429 && { data: { reason: 'upstream_rate_limited' } }),
+  });
+  const { statusText: _reasonPhrase, ...rest } = data ?? {};
+  return new McpError(code, `OEIS returned HTTP ${res.status}.`, rest);
+}
+
 function headerInt(value: string | null): number | undefined {
   if (value === null) return;
   const n = Number(value.trim());
@@ -164,7 +202,7 @@ function parseBFile(text: string, cut: boolean): BFileTerm[] {
 
 /** Reads the shared `/search` 403 body: the anonymous paging cap, or an edge refusal. */
 async function searchRefusal(res: Response): Promise<McpError> {
-  const body = (await res.text()).trimStart();
+  const body = (await readText(res, REFUSAL_MAX_BYTES)).trimStart();
   if (body.startsWith('Sign in to see search results')) {
     return validationError(
       'OEIS shows anonymous users only the first 110 results of a query; narrow the query instead of paging deeper.',
@@ -198,15 +236,21 @@ export class OeisService {
     this.userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
   }
 
-  /** The cached record for an A-number, fresh or stale, without any upstream request. */
+  /**
+   * The cached record for an A-number while it is younger than 24 h, without any upstream request.
+   * A peek: it leaves the entry's place in the LRU order alone.
+   */
   getCachedRecord(aNumber: string): SequenceRecord | undefined {
-    const value = this.cache.get(`record:${aNumber}`)?.value;
-    return value?.kind === 'record' ? value.record : undefined;
+    const cached = this.cache.peek(`record:${aNumber}`);
+    return cached?.value.kind === 'record' && cached.expiresAt > this.now()
+      ? cached.value.record
+      : undefined;
   }
 
   /**
    * Fetches and normalizes one record. A cached record younger than 24 h is served as-is; an
-   * older one is revalidated with `If-Modified-Since` (a `304` refreshes it without a body).
+   * older one is revalidated with `If-Modified-Since` (a `304` refreshes it without a body). A
+   * `404` is remembered for 1 h, so a repeated missing A-number makes no further request.
    *
    * @returns The record, or `undefined` when OEIS answers `404` for the A-number.
    */
@@ -217,11 +261,17 @@ export class OeisService {
   ): Promise<SequenceRecord | undefined> {
     const key = `record:${aNumber}`;
     const cached = this.cache.get(key);
-    const entry = cached?.value.kind === 'record' ? cached.value : undefined;
-    if (cached && entry && cached.expiresAt > this.now()) {
-      ctx.log.debug('OEIS record cache hit', { aNumber });
-      return entry.record;
+    if (cached && cached.expiresAt > this.now()) {
+      if (cached.value.kind === 'missing') {
+        ctx.log.debug('OEIS record 404 cache hit', { aNumber });
+        return;
+      }
+      if (cached.value.kind === 'record') {
+        ctx.log.debug('OEIS record cache hit', { aNumber });
+        return cached.value.record;
+      }
     }
+    const entry = cached?.value.kind === 'record' ? cached.value : undefined;
 
     const outcome = await this.call<RecordOutcome>(
       'getRecord',
@@ -240,7 +290,7 @@ export class OeisService {
         const lastModified = res.headers.get('last-modified') ?? undefined;
         return {
           kind: 'ok',
-          record: parseRecordBody(await res.text()),
+          record: parseRecordBody(await readText(res, RECORD_MAX_BYTES)),
           ...(lastModified && { lastModified }),
         };
       },
@@ -249,7 +299,7 @@ export class OeisService {
     );
 
     if (outcome.kind === 'missing') {
-      this.cache.delete(key);
+      this.cache.set(key, MISSING, heapCharge(MISSING), this.now() + MISSING_TTL_MS);
       return;
     }
     const fresh = outcome.kind === 'ok' ? outcome : entry;
@@ -265,7 +315,7 @@ export class OeisService {
         record: fresh.record,
         ...(fresh.lastModified && { lastModified: fresh.lastModified }),
       },
-      JSON.stringify(fresh.record).length,
+      heapCharge(fresh.record),
       this.now() + RECORD_TTL_MS,
     );
     return fresh.record;
@@ -297,17 +347,12 @@ export class OeisService {
       {},
       async (res) => {
         if (res.status === 403) throw await searchRefusal(res);
-        return parseSearchText(await res.text());
+        return parseSearchText(await readText(res, SEARCH_MAX_BYTES));
       },
       ctx,
       options.deadlineMs,
     );
-    this.cache.set(
-      key,
-      { kind: 'search', page },
-      JSON.stringify(page).length,
-      this.now() + SEARCH_TTL_MS,
-    );
+    this.cache.set(key, { kind: 'search', page }, heapCharge(page), this.now() + SEARCH_TTL_MS);
     return page;
   }
 
@@ -357,12 +402,7 @@ export class OeisService {
       ctx,
       options.deadlineMs,
     );
-    this.cache.set(
-      key,
-      { kind: 'bfile', read },
-      JSON.stringify(read).length,
-      this.now() + BFILE_TTL_MS,
-    );
+    this.cache.set(key, { kind: 'bfile', read }, heapCharge(read), this.now() + BFILE_TTL_MS);
     return read;
   }
 
@@ -409,8 +449,8 @@ export class OeisService {
 
   /**
    * One fetch + read against an accept-list: a listed status is a result for `read`, an
-   * unlisted `403` is an edge refusal, and anything else is classified from the response — a
-   * `429` with `reason: 'upstream_rate_limited'` beside the `retryAfter` it carries.
+   * unlisted `403` is an edge refusal, and anything else is classified from its status and
+   * headers — a `429` with `reason: 'upstream_rate_limited'` beside the `retryAfter` it carries.
    * Raw fetch failures are classified here so none surfaces as `InternalError`.
    */
   private async attempt<T>(
@@ -433,10 +473,7 @@ export class OeisService {
           await discard(res);
           throw edgeRefusal();
         }
-        throw await httpErrorFromResponse(res, {
-          service: 'OEIS',
-          ...(res.status === 429 && { data: { reason: 'upstream_rate_limited' } }),
-        });
+        throw await unexpectedStatus(res);
       }
       return await read(res);
     } catch (err) {

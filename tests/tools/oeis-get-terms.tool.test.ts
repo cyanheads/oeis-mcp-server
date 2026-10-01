@@ -28,7 +28,7 @@ import {
   synthesizedBFile,
 } from '../fixtures/oeis-upstream.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
-import { blocksText, serviceOver, withBackoff } from '../fixtures/tool-service.js';
+import { blocksText, immediatePacer, serviceOver, withBackoff } from '../fixtures/tool-service.js';
 
 const holder = vi.hoisted(() => ({ service: undefined as unknown }));
 vi.mock('@/services/oeis/oeis-service.js', async (importOriginal) => ({
@@ -664,6 +664,25 @@ describe('oeis_get_terms', () => {
       expect(structured(result).notice).toBe(
         'This entry has no b-file; these are the data-line terms only.',
       );
+    });
+
+    it('requests the b-file again once a cached record that named none is past its 24 h', async () => {
+      const clock = { now: 1_800_000_000_000 };
+      const { calls, fetch } = scriptedFetch(
+        record(minimalRecordJson),
+        bFile(bFileText(['7', '8', '9', '10'], 1)),
+      );
+      const service = new OeisService({ fetch, now: () => clock.now, pacer: immediatePacer() });
+      holder.service = service;
+      await service.getRecord('A388000', createMockContext());
+      clock.now += 24 * 60 * 60 * 1000;
+
+      const result = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+        '/A388000',
+        '/A388000/b388000.txt',
+      ]);
+      expect(structured(result)).toMatchObject({ source: 'bfile', lastAvailableIndex: 4 });
     });
 
     it('requests the b-file when a cached record links one, and uses it', async () => {

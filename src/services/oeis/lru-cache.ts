@@ -3,9 +3,18 @@
  * @module services/oeis/lru-cache
  */
 
+/**
+ * The bytes a cached value is charged against the budget: 3 per UTF-16 code unit of its JSON form.
+ * A parsed record or b-file read holds up to about that much heap per unit of its JSON once string
+ * and object headers are counted, so the budget bounds the heap the cache holds.
+ */
+export function heapCharge(value: unknown): number {
+  return 3 * JSON.stringify(value).length;
+}
+
 /** One cached value with its expiry instant and accounted size. */
 export interface CacheEntry<V> {
-  /** Serialized size charged against the byte budget. */
+  /** Bytes charged against the budget. */
   bytes: number;
   /** Epoch milliseconds after which the entry is stale. */
   expiresAt: number;
@@ -13,7 +22,7 @@ export interface CacheEntry<V> {
 }
 
 /**
- * Least-recently-used cache bounded by total serialized bytes. Expiry is advisory: a stale entry
+ * Least-recently-used cache bounded by total charged bytes. Expiry is advisory: a stale entry
  * stays readable until evicted, so a caller can revalidate it (e.g. `If-Modified-Since`).
  */
 export class LruCache<V> {
@@ -33,6 +42,11 @@ export class LruCache<V> {
       this.entries.set(key, entry);
     }
     return entry;
+  }
+
+  /** Returns the entry (fresh or stale) without marking it used. */
+  peek(key: string): CacheEntry<V> | undefined {
+    return this.entries.get(key);
   }
 
   /** Stores a value, evicting least-recently-used entries until the budget holds. */

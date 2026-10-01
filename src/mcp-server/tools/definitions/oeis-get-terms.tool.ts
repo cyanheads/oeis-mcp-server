@@ -157,11 +157,9 @@ export const oeisGetTerms = tool('oeis_get_terms', {
     if (bFile?.status === 'ok') {
       terms = bFile.terms;
     } else {
-      const record =
-        cached ??
-        (await service.getRecord(aNumber, ctx, {
-          deadlineMs: Math.max(0, DEFAULT_DEADLINE_MS - (Date.now() - startedAt)),
-        }));
+      const record = await service.getRecord(aNumber, ctx, {
+        deadlineMs: Math.max(0, DEFAULT_DEADLINE_MS - (Date.now() - startedAt)),
+      });
       if (!record) {
         throw ctx.fail('sequence_not_found', `OEIS has no entry ${aNumber}.`, { aNumber });
       }

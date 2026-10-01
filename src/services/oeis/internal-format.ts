@@ -21,9 +21,12 @@ interface RecordLines {
   offset?: string;
 }
 
-/** Throws the non-retryable "format changed" failure for a page this parser cannot read. */
+/**
+ * Throws the non-retryable "format changed" failure for a page this parser cannot read. `detail` is
+ * server-written: it names the part that failed, never the upstream text in it.
+ */
 function formatChanged(detail: string): never {
-  throw serviceUnavailable(`OEIS returned a search page in an unrecognized format: ${detail}`, {
+  throw serviceUnavailable(`OEIS returned a search page in an unrecognized format: ${detail}.`, {
     reason: 'upstream_unparseable',
     retryable: false,
   });
@@ -41,14 +44,12 @@ function readStatus(line: string | undefined): {
   }
   if (trimmed === NO_RESULTS) return { status: 'none', total: 0 };
   if (trimmed === TOO_MANY) return { status: 'too_many' };
-  return formatChanged(`unknown status line "${trimmed.slice(0, 120)}"`);
+  return formatChanged('an unknown status line');
 }
 
 function firstIndexOf(aNumber: string, offset: string): number {
   const firstIndex = Number.parseInt(offset.split(',')[0] ?? '', 10);
-  if (!Number.isFinite(firstIndex)) {
-    formatChanged(`record ${aNumber} has an unreadable offset "${offset}"`);
-  }
+  if (!Number.isFinite(firstIndex)) formatChanged(`record ${aNumber} has an unreadable offset`);
   return firstIndex;
 }
 

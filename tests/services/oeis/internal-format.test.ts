@@ -275,20 +275,18 @@ describe('parseSearchText', () => {
       expect(error.data).not.toMatchObject({ retryable: false });
     });
 
-    it('an unknown status line is non-retryable and quotes the line', () => {
+    it('an unknown status line is non-retryable and stays out of the message', () => {
       const error = parseError('Search: x\nSomething new happened.\n');
       expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
-      expect(error.message).toContain('Something new happened.');
+      expect(error.message).toBe(
+        'OEIS returned a search page in an unrecognized format: an unknown status line.',
+      );
+      expect(JSON.stringify(error.data)).not.toContain('Something new');
     });
 
     it('a Search: line with nothing after it is a non-retryable unknown status', () => {
       const error = parseError('Search: x');
       expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
-    });
-
-    it('truncates a very long unknown status line in the message', () => {
-      const error = parseError(`Search: x\n${'z'.repeat(500)}\n`);
-      expect(error.message.length).toBeLessThan(300);
     });
 
     it('a record with no %N line is non-retryable', () => {
@@ -304,10 +302,14 @@ describe('parseSearchText', () => {
       expect(error.message).toContain('%O');
     });
 
-    it('an unreadable offset is non-retryable', () => {
-      const error = parseError('Search: x\nShowing 1-1 of 1\n%N A000001 Name\n%O A000001 abc\n');
+    it('an unreadable offset is non-retryable and stays out of the message', () => {
+      const error = parseError(
+        'Search: x\nShowing 1-1 of 1\n%N A000001 Name\n%O A000001 see <a href="x">here</a>\n',
+      );
       expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
-      expect(error.message).toContain('"abc"');
+      expect(error.message).toContain('A000001');
+      expect(error.message).not.toContain('here');
+      expect(JSON.stringify(error.data)).not.toContain('here');
     });
   });
 });

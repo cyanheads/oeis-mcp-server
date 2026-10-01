@@ -17,6 +17,15 @@ import {
   SequenceSummarySchema,
 } from '@/mcp-server/shared/oeis-schemas.js';
 
+const MIB = 1024 * 1024;
+
+/** Milliseconds `run` takes: far above linear cost at 1 MiB, far below quadratic. */
+function elapsedMs(run: () => unknown): number {
+  const started = performance.now();
+  run();
+  return performance.now() - started;
+}
+
 describe('constants', () => {
   it('fixes the page size at 10 and the reachable start at 100', () => {
     expect(PAGE_SIZE).toBe(10);
@@ -91,8 +100,18 @@ describe('normalizeANumber', () => {
     ['https://oeis.org/A000045?fmt=json', 'A000045'],
     ['https://oeis.org/A000045#comments', 'A000045'],
     ['https://oeis.org/A000045/', 'A000045'],
+    ['https://oeis.org/A000045#x\ny', 'A000045'],
   ])('maps %j to %j', (input, expected) => {
     expect(normalizeANumber(input)).toBe(expected);
+  });
+
+  it.each([
+    ['a slash run before a line break', `${'/'.repeat(MIB - 2)}\nx`],
+    ['the percent-encoded form a resource URI carries', `${'%2F'.repeat((MIB - 4) / 3)}%0Ax`],
+  ])('reads 1 MiB of %s in linear time', (_shape, input) => {
+    let parsed: ReturnType<typeof ANumberSchema.safeParse> | undefined;
+    expect(elapsedMs(() => (parsed = ANumberSchema.safeParse(input)))).toBeLessThan(250);
+    expect(parsed?.success).toBe(false);
   });
 
   it.each([

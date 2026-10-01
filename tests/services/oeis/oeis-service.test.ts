@@ -94,6 +94,32 @@ async function withBackoff<T>(promise: Promise<T>): Promise<T> {
   return outcome.value;
 }
 
+/**
+ * A body streamed in 64 KiB chunks as the reader asks for them, recording the most bytes any one
+ * response handed over and whether a reader cancelled the stream.
+ */
+function streamedBody(text: string, init: ResponseInit) {
+  const bytes = new TextEncoder().encode(text);
+  const seen = { pulled: 0, cancelled: false };
+  const step: FetchStep = () => {
+    let at = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (at >= bytes.length) return controller.close();
+        const chunk = bytes.subarray(at, at + 65_536);
+        at += chunk.length;
+        seen.pulled = Math.max(seen.pulled, at);
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        seen.cancelled = true;
+      },
+    });
+    return new Response(stream, init);
+  };
+  return { seen, size: bytes.length, step };
+}
+
 async function caught(promise: Promise<unknown>): Promise<McpError> {
   try {
     await promise;
@@ -238,13 +264,20 @@ describe('OeisService.getRecord', () => {
       expect(h.fetchCalls).toHaveLength(0);
     });
 
-    it('returns the record after a fetch, and still returns it once stale', async () => {
+    it('returns the record while it is fresh, and nothing once it is stale', async () => {
       const h = harness([json()]);
       const record = await h.service.getRecord('A000045', h.ctx);
+      h.clock.now += DAY - 1;
       expect(h.service.getCachedRecord('A000045')).toBe(record);
-      h.clock.now += 30 * DAY;
-      expect(h.service.getCachedRecord('A000045')).toBe(record);
+      h.clock.now += 1;
+      expect(h.service.getCachedRecord('A000045')).toBeUndefined();
       expect(h.fetchCalls).toHaveLength(1);
+    });
+
+    it('returns nothing for an A-number OEIS answered 404', async () => {
+      const h = harness([res('gone', { status: 404 })]);
+      await h.service.getRecord('A999999', h.ctx);
+      expect(h.service.getCachedRecord('A999999')).toBeUndefined();
     });
 
     it('does not mistake a cached search or b-file for a record', async () => {
@@ -261,12 +294,38 @@ describe('OeisService.getRecord', () => {
       expect(h.fetchCalls).toHaveLength(1);
     });
 
-    it('evicts a stale cached record when OEIS now answers 404', async () => {
+    it('drops a stale cached record when OEIS now answers 404', async () => {
       const h = harness([json(), res('gone', { status: 404 })]);
       await h.service.getRecord('A000045', h.ctx);
       h.clock.now += DAY;
       await expect(h.service.getRecord('A000045', h.ctx)).resolves.toBeUndefined();
       expect(h.service.getCachedRecord('A000045')).toBeUndefined();
+      await expect(h.service.getRecord('A000045', h.ctx)).resolves.toBeUndefined();
+      expect(h.fetchCalls).toHaveLength(2);
+    });
+
+    it('remembers a 404 for an hour, so repeating a missing A-number makes one request', async () => {
+      const h = harness([res('gone', { status: 404 })]);
+      await expect(h.service.getRecord('A999999', h.ctx)).resolves.toBeUndefined();
+      h.clock.now += HOUR - 1;
+      await expect(h.service.getRecord('A999999', h.ctx)).resolves.toBeUndefined();
+      await expect(h.service.getRecord('A999999', h.ctx)).resolves.toBeUndefined();
+      expect(h.fetchCalls).toHaveLength(1);
+
+      h.clock.now += 1;
+      await expect(h.service.getRecord('A999999', h.ctx)).resolves.toBeUndefined();
+      expect(h.fetchCalls).toHaveLength(2);
+      expect(h.fetchCalls[1]?.headers.has('if-modified-since')).toBe(false);
+    });
+
+    it('serves a record once a remembered 404 has expired and OEIS answers 200', async () => {
+      const h = harness([res('gone', { status: 404 }), json()]);
+      await h.service.getRecord('A000045', h.ctx);
+      h.clock.now += HOUR;
+      await expect(h.service.getRecord('A000045', h.ctx)).resolves.toMatchObject({
+        aNumber: 'A000045',
+      });
+      expect(h.service.getCachedRecord('A000045')).toMatchObject({ aNumber: 'A000045' });
     });
   });
 
@@ -352,6 +411,35 @@ describe('OeisService.getRecord', () => {
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
       expect(error.data).toMatchObject({ retryAttempts: 3 });
       expect(h.fetchCalls).toHaveLength(3);
+    });
+
+    it('classifies a 503 from its status and headers alone: no body text or reason phrase reaches the error', async () => {
+      const page = streamedBody(
+        '<!doctype html><html><body><h1>db01 is down</h1><pre>at Backend.query</pre></body></html>',
+        { status: 503, statusText: 'Backend db01 unavailable', headers: { 'retry-after': '1' } },
+      );
+      const h = harness([page.step]);
+      const error = await caught(withBackoff(h.service.getRecord('A000045', h.ctx)));
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.message).toBe('OEIS returned HTTP 503. (failed after 3 attempts)');
+      expect(error.data).toMatchObject({ status: 503, retryAfter: '1', retryAttempts: 3 });
+      expect(error.data).not.toHaveProperty('body');
+      expect(error.data).not.toHaveProperty('responseBody');
+      expect(JSON.stringify(error.data)).not.toContain('db01');
+    });
+
+    it('stops reading a record body past 4 MiB and fails it as unparseable', async () => {
+      const comment = 'x'.repeat(5 * 1_048_576);
+      const body = streamedBody(recordBody(recordWith({ comment: [comment] })), { status: 200 });
+      const h = harness([body.step]);
+      const error = await caught(withBackoff(h.service.getRecord('A000045', h.ctx)));
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_unparseable' },
+      });
+      expect(body.seen.cancelled).toBe(true);
+      expect(body.seen.pulled).toBeLessThan(4 * 1_048_576 + 3 * 65_536);
+      expect(body.size).toBeGreaterThan(5 * 1_048_576);
     });
 
     it('maps a network failure to "oeis.org is unreachable" and retries it', async () => {
@@ -581,6 +669,15 @@ describe('OeisService.search', () => {
       const error = await caught(h.service.search(params, ctx));
       expect(error.data).toMatchObject({ reason: 'upstream_refused' });
     });
+
+    it('stops reading a 403 body past 64 KiB and reads it as upstream_refused', async () => {
+      const body = streamedBody(`${signInRefusalBody}\n${'x'.repeat(1_048_576)}`, { status: 403 });
+      const h = harness([body.step]);
+      const error = await caught(h.service.search(params, ctx));
+      expect(error.data).toMatchObject({ reason: 'upstream_refused', retryable: false });
+      expect(body.seen.cancelled).toBe(true);
+      expect(body.seen.pulled).toBeLessThan(65_536 + 3 * 65_536);
+    });
   });
 
   describe('accept list', () => {
@@ -637,6 +734,21 @@ describe('OeisService.search', () => {
       );
       expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
       expect(h.fetchCalls).toHaveLength(1);
+    });
+
+    it('stops reading a search page past 16 MiB and fails it as unparseable', async () => {
+      const head =
+        'Search: x\n\nShowing 1-1 of 1\n\n%N A000045 Fibonacci numbers.\n%O A000045 0,4\n';
+      const filler = `%C A000045 ${'x'.repeat(1_000)}\n`.repeat(17 * 1_048);
+      const body = streamedBody(head + filler, { status: 200 });
+      const h = harness([body.step]);
+      const error = await caught(
+        withBackoff(h.service.search({ q: 'x', sort: 'relevance', start: 0 }, ctx)),
+      );
+      expect(error.data).toMatchObject({ reason: 'upstream_unparseable' });
+      expect(body.seen.cancelled).toBe(true);
+      expect(body.seen.pulled).toBeLessThan(16 * 1_048_576 + 3 * 65_536);
+      expect(body.size).toBeGreaterThan(16 * 1_048_576);
     });
   });
 });

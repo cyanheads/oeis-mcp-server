@@ -386,6 +386,23 @@ describe('oeis_get_cross_refs', () => {
         const rows = await refsOf(['Cf. A000032.', 'See A000032 (Lucas numbers).']);
         expect(rows[0]).toMatchObject({ lineIndex: 0, note: 'Lucas numbers' });
       });
+
+      it('balances a later parenthetical inside an earlier unclosed one', async () => {
+        const rows = await refsOf(['Cf. A000032 (open A001045 (closed) and A001622 (x)']);
+        expect(rows.map((row) => [row.aNumber, row.note])).toEqual([
+          ['A000032', undefined],
+          ['A001045', 'closed'],
+          ['A001622', 'x'],
+        ]);
+      });
+
+      it('reads 1 MiB of mentions before unclosed parentheses in linear time', async () => {
+        const line = `Cf. ${'A000032 ('.repeat(Math.floor((1024 * 1024) / 9))}`;
+        const started = performance.now();
+        const rows = await refsOf([line]);
+        expect(performance.now() - started).toBeLessThan(250);
+        expect(rows.map((row) => [row.aNumber, row.note])).toEqual([['A000032', undefined]]);
+      });
     });
 
     describe('unsafe hrefs', () => {
@@ -437,6 +454,27 @@ describe('oeis_get_cross_refs', () => {
         expect(structured(result).lines).toEqual(['Cf. <a>A000032</a>, <a>A001045</a>.']);
         expect(related(result).map((row) => row.aNumber)).toEqual(['A000032', 'A001045']);
         expect(textOf(result)).not.toMatch(/javascript:|data:/i);
+      });
+
+      it('escapes link, image, and HTML syntax in notes and lines, and keeps both verbatim in structuredContent', async () => {
+        const line =
+          'Cf. A000032 (see [here](https://attacker.example/n)), A001045 (<img src=x onerror=alert(7)>).';
+        const { result } = await crossRefs(
+          { aNumber: 'A45' },
+          record(withXref([line])),
+          page(batchPage('A000032', 'A001045')),
+        );
+        expect(related(result).map((row) => row.note)).toEqual([
+          'see [here](https://attacker.example/n)',
+          '<img src=x onerror=alert(7)>',
+        ]);
+        expect(structured(result).lines).toEqual([line]);
+        const text = textOf(result);
+        expect(text).toContain('**Note:** see [here\\](https://attacker.example/n)');
+        expect(text).toContain('**Note:** \\<img src=x onerror=alert(7)>');
+        expect(text).toContain(
+          '> Cf. A000032 (see [here\\](https://attacker.example/n)), A001045 (\\<img src=x onerror=alert(7)>).',
+        );
       });
     });
 
@@ -652,9 +690,21 @@ describe('oeis_get_cross_refs', () => {
         const { calls, result } = await degraded([res('oops', { status: 502 })]);
         expectUnresolvedPage(result);
         expect(calls).toHaveLength(4);
-        expect(structured(result).notice).toMatch(
-          /^Names and terms for these A-numbers could not be fetched \(.+\); call oeis_get_cross_refs again with the same start after about 10 seconds, or pass an A-number to oeis_get_sequence\.$/,
+        expect(structured(result).notice).toBe(
+          'Names and terms for these A-numbers could not be fetched (upstream_unavailable); call oeis_get_cross_refs again with the same start after about 10 seconds, or pass an A-number to oeis_get_sequence.',
         );
+      });
+
+      it('names a reason code, never the failure message, when the failure carries no reason', async () => {
+        const { service } = serviceOver(record(withXref(NOTE_LINES)));
+        holder.service = service;
+        vi.spyOn(service, 'search').mockRejectedValueOnce(
+          serviceUnavailable('<h1>Backend db01 down</h1>'),
+        );
+        const result = await runToolContract(oeisGetCrossRefs, { aNumber: 'A45' });
+        expectUnresolvedPage(result);
+        expect(structured(result).notice).toContain('could not be fetched (upstream_unavailable)');
+        expect(JSON.stringify(result)).not.toContain('db01');
       });
 
       it('names the upstream reason when the failure carries one', async () => {
@@ -673,7 +723,7 @@ describe('oeis_get_cross_refs', () => {
       it('degrades a network failure to unresolved rows', async () => {
         const { result } = await degraded([new TypeError('fetch failed')]);
         expectUnresolvedPage(result);
-        expect(String(structured(result).notice)).toContain('oeis.org is unreachable.');
+        expect(structured(result).notice).toContain('could not be fetched (upstream_unavailable)');
       });
 
       it('degrades a timeout to unresolved rows', async () => {
@@ -688,7 +738,7 @@ describe('oeis_get_cross_refs', () => {
         );
         const result = await withBackoff(runToolContract(oeisGetCrossRefs, { aNumber: 'A45' }));
         expectUnresolvedPage(result);
-        expect(String(structured(result).notice)).toContain('OEIS did not answer within 15 s.');
+        expect(structured(result).notice).toContain('could not be fetched (upstream_timeout)');
       });
 
       it('carries a 429 Retry-After into the notice, in whole seconds', async () => {

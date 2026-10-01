@@ -518,12 +518,13 @@ describe('oeis_get_sequence', () => {
       expect(textOf(result)).toContain('Recovery:');
     });
 
-    it('does not retry a 404 and does not cache it', async () => {
+    it('does not retry a 404, and answers a repeat from the remembered 404 without a request', async () => {
       const { calls, service } = serviceOver(res('', { status: 404 }));
       holder.service = service;
       await runToolContract(oeisGetSequence, { aNumber: 'A999999' });
-      await runToolContract(oeisGetSequence, { aNumber: 'A999999' });
-      expect(calls).toHaveLength(2);
+      const repeat = await runToolContract(oeisGetSequence, { aNumber: 'A999999' });
+      expect(errorOf(repeat)).toMatchObject({ data: { reason: 'sequence_not_found' } });
+      expect(calls).toHaveLength(1);
     });
 
     it('surfaces a 403 edge refusal as upstream_refused, never Forbidden, without retrying', async () => {
@@ -798,6 +799,50 @@ describe('oeis_get_sequence', () => {
       expect(lines.filter((line) => line === '> ## Injected heading')).toHaveLength(5);
       expect(lines.filter((line) => line === '> # Another')).toHaveLength(5);
       expect(structured(result).name).toBe(`Name${inject}`);
+    });
+
+    it('escapes link, image, and HTML syntax in contributor text and keeps structuredContent verbatim', async () => {
+      const raw = recordWith({
+        name: 'Evil ![beacon](https://attacker.example/b.png) [docs](https://attacker.example/x) <img src=x onerror=alert(1)>',
+        author: '_Evil_ <iframe src="javascript:alert(3)"></iframe>',
+        comment: [
+          '[harmless-looking](javascript:alert(4)) <img src="https://attacker.example/c.png">',
+        ],
+        formula: ['a(n) = [x^n] 1/(1 - x - x^2) < 2^n.'],
+        link: [
+          'Sloane, &lt;img src=x onerror=alert(6)&gt; and &lt;a href=&quot;https://attacker.example&quot;&gt;x&lt;/a&gt;',
+        ],
+        xref: ['Cf. A000032 (see [here](https://attacker.example/n)).'],
+        ext: ['[ref]: https://attacker.example/def'],
+      });
+      const { result } = await fetchSequence({ aNumber: 'A45' }, ok(raw));
+      const text = textOf(result);
+      expect(text).toContain(
+        '# A000045: Evil !\\[beacon\\](https://attacker.example/b.png) [docs\\](https://attacker.example/x) \\<img src=x onerror=alert(1)>',
+      );
+      expect(text).toContain('**Author:** _Evil_ \\<iframe src="javascript:alert(3)">\\</iframe>');
+      expect(text).toContain(
+        '> [harmless-looking\\](javascript:alert(4)) \\<img src="https://attacker.example/c.png">',
+      );
+      expect(text).toContain('> a(n) = [x^n] 1/(1 - x - x^2) < 2^n.');
+      expect(text).toContain(
+        '- Sloane, \\<img src=x onerror=alert(6)> and \\<a href="https://attacker.example">x\\</a>\n',
+      );
+      expect(text).toContain('> Cf. A000032 (see [here\\](https://attacker.example/n)).');
+      expect(text).toContain('> \\[ref]: https://attacker.example/def');
+
+      const out = structured(result);
+      expect(out.name).toBe(raw.name);
+      expect(out.author).toBe(raw.author);
+      expect(out.comments).toEqual(raw.comment);
+      expect(out.links).toEqual([
+        {
+          text: 'Sloane, <img src=x onerror=alert(6)> and <a href="https://attacker.example">x</a>',
+          urls: [],
+        },
+      ]);
+      expect(out.crossReferences).toEqual(raw.xref);
+      expect(out.extensions).toEqual(raw.ext);
     });
 
     it('lengthens the fence past any backtick run in example and program text', async () => {

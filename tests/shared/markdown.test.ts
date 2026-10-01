@@ -1,7 +1,7 @@
 /**
- * @fileoverview Tests for the shared markdown helpers: inline flattening, blockquotes,
- * dynamic-length fences, and the summary-row block. CR/LF in upstream text must stay out of
- * inline slots.
+ * @fileoverview Tests for the shared markdown helpers: inline flattening, blockquotes, markup
+ * escaping, dynamic-length fences, and the summary-row block. CR/LF in upstream text must stay out
+ * of inline slots, and link, image, and HTML syntax must render as text.
  * @module tests/shared/markdown.test
  */
 
@@ -58,6 +58,96 @@ describe('blockquote', () => {
   it('leaves no unquoted line when upstream text tries to start a heading or list', () => {
     const lines = blockquote('# heading\r\n- item\r\n---').split('\n');
     expect(lines.every((line) => line.startsWith('> '))).toBe(true);
+  });
+});
+
+describe('markup in contributor text', () => {
+  const MIB = 1024 * 1024;
+
+  /** Each link, image, or HTML opener in `text` that no odd run of backslashes escapes. */
+  const liveMarkup = (text: string) =>
+    [...text.matchAll(/(?<!\\)(?:\\\\)*(?:\]\(|<[A-Za-z/!?])|!\[/g)].map((match) => match[0]);
+
+  it.each([
+    'Evil ![beacon](https://attacker.example/b.png?v=1) [docs](https://attacker.example/x)',
+    '[harmless-looking](javascript:alert(4))',
+    '<img src=x onerror=alert(1)> <iframe src="javascript:alert(3)"></iframe>',
+    '<https://attacker.example/autolink> <!-- comment --> <?php ?> <!DOCTYPE html>',
+    '\\[x](u) and [y\\\\](v) and \\\\<b>bold\\\\</b>',
+    'line one\n<div>\n[two](https://attacker.example)\r\n![three](x)',
+  ])('leaves no live link, image, or tag in %j, inline or quoted', (text) => {
+    expect(liveMarkup(inline(text))).toEqual([]);
+    expect(liveMarkup(blockquote(text))).toEqual([]);
+  });
+
+  it.each([
+    ['see [docs](https://e.example/x)', 'see [docs\\](https://e.example/x)'],
+    ['![b](https://e.example/b.png)', '!\\[b\\](https://e.example/b.png)'],
+    ['<img src=x onerror=alert(1)>', '\\<img src=x onerror=alert(1)>'],
+    ['a </a> b', 'a \\</a> b'],
+    ['<!-- c --> <?x?>', '\\<!-- c --> \\<?x?>'],
+    ['<https://e.example>', '\\<https://e.example>'],
+    ['a(n) = [x^n](1 + x + x^2)^n', 'a(n) = [x^n\\](1 + x + x^2)^n'],
+  ])('escapes only the character that opens the markup in %j', (text, expected) => {
+    expect(inline(text)).toBe(expected);
+  });
+
+  it.each([
+    ['\\[x](u)', '\\[x\\](u)'],
+    ['[x\\](u)', '[x\\](u)'],
+    ['[x\\\\](u)', '[x\\\\\\](u)'],
+    ['\\<b>', '\\<b>'],
+    ['\\\\<b>', '\\\\\\<b>'],
+    ['\\\\\\![i](u)', '\\\\\\!\\[i\\](u)'],
+  ])('counts the backslash run before an opener in %j', (text, expected) => {
+    expect(inline(text)).toBe(expected);
+  });
+
+  it.each([
+    ['[x]: https://e.example', '\\[x]: https://e.example'],
+    ['[a\\]b]: javascript:x', '\\[a\\]b]: javascript:x'],
+    ['[a](b)]: c', '\\[a\\](b)]: c'],
+  ])('escapes the bracket that opens a link reference definition in %j', (text, expected) => {
+    expect(inline(text)).toBe(expected);
+  });
+
+  it('escapes a link reference definition on any quoted line, inside nested containers, or across lines', () => {
+    expect(blockquote('first line\n[x]: https://e.example "t"')).toBe(
+      '> first line\n> \\[x]: https://e.example "t"',
+    );
+    expect(blockquote('> - [x]: https://e.example')).toBe('> > - \\[x]: https://e.example');
+    expect(blockquote('[multi\nline]: https://e.example')).toBe(
+      '> \\[multi\n> line]: https://e.example',
+    );
+  });
+
+  it.each([
+    'a(n) < 2^n for n >= 1.',
+    'a(n) <= 2*a(n-1) <= 4^n; 0 < k < n; a(n) > 0; x<>y; p <=> q; n <- n+1.',
+    'a(n) = [x^n] 1/(1 - x - x^2).',
+    '[x^n] f(x) = Sum_{k=0..floor(n/2)} binomial(n-k, k).',
+    'T(n,k) = [k <= n] * binomial(n,k); a(n) = n*[n odd].',
+    'G.f.: x/(1 - x - x^2). E.g.f.: exp(x/2)*sinh(sqrt(5)*x/2).',
+    'Table[Fibonacci[n], {n, 0, 40}]; a[n_] := a[n-1] + a[n-2]',
+    'a(n) ~ phi^n/sqrt(5) as n -> oo, where phi = (1+sqrt(5))/2; 3! = 6, [1, 2], [3, 5, 8].',
+    '(PARI) a(n) = if(n<1, 0, fibonacci(n)) \\\\ a comment',
+  ])('leaves the formula %j exactly as written', (text) => {
+    expect(inline(text)).toBe(text);
+    expect(blockquote(text)).toBe(`> ${text}`);
+  });
+
+  it.each([
+    ['a backslash run before a link', `${'\\'.repeat(MIB - 2)}](`],
+    ['brackets before one definition colon', `${'['.repeat(MIB - 2)}]:`],
+    ['repeated link openers', '](!['.repeat(MIB / 4)],
+    ['repeated tag openers', '<a '.repeat(MIB / 4)],
+    ['bracketed lines', '[\n'.repeat(MIB / 2)],
+  ])('escapes 1 MiB of %s in linear time', (_shape, text) => {
+    for (const render of [inline, blockquote]) {
+      const started = performance.now();
+      render(text);
+      expect(performance.now() - started).toBeLessThan(250);
+    }
   });
 });
 

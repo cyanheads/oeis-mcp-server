@@ -1,11 +1,12 @@
 /**
  * @fileoverview Tests for the byte-budgeted LRU cache: budget accounting, eviction order,
- * oversized entries, and stale entries staying readable.
+ * oversized entries, stale entries staying readable, peeks that leave the order alone, and the
+ * heap charge of a cached value.
  * @module tests/services/oeis/lru-cache.test
  */
 
 import { describe, expect, it } from 'vitest';
-import { LruCache } from '@/services/oeis/lru-cache.js';
+import { heapCharge, LruCache } from '@/services/oeis/lru-cache.js';
 
 const FAR = Number.MAX_SAFE_INTEGER;
 
@@ -116,5 +117,24 @@ describe('LruCache', () => {
     cache.set('c', 'c', 4, FAR);
     expect(cache.get('fresh-old')).toBeUndefined();
     expect(cache.get('stale-new')).toBeDefined();
+  });
+
+  it('peeks at an entry without counting it as use', () => {
+    const cache = new LruCache<string>(10);
+    cache.set('a', 'a', 4, FAR);
+    cache.set('b', 'b', 4, FAR);
+    expect(cache.peek('a')).toEqual({ value: 'a', bytes: 4, expiresAt: FAR });
+    cache.set('c', 'c', 4, FAR);
+    expect(cache.peek('a')).toBeUndefined();
+    expect(cache.peek('b')).toBeDefined();
+  });
+});
+
+describe('heapCharge', () => {
+  it('charges 3 bytes per UTF-16 code unit of the JSON form', () => {
+    const read = { status: 'ok', terms: [{ n: 0, value: '0' }], cut: false };
+    expect(heapCharge(read)).toBe(3 * JSON.stringify(read).length);
+    expect(heapCharge({ name: 'φ' })).toBe(3 * '{"name":"φ"}'.length);
+    expect(heapCharge({ kind: 'missing' })).toBe(54);
   });
 });

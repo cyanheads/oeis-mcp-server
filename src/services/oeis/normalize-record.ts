@@ -37,7 +37,11 @@ const RawRecordSchema = z.object({
 
 /** A `program` line that opens a new block: `(PARI) …`, `(Python) …`, `(SageMath)`. */
 const PROGRAM_TAG = /^\(([A-Z][A-Za-z0-9+#/._ -]{0,24})\)(\s|$)/;
-const HREF = /<a\s[^>]*?href\s*=\s*"([^"]*)"/gi;
+/**
+ * The double-quoted `href` of an anchor tag. The attribute scan stops at the next `<` or `>`, so
+ * the scans of successive unclosed tags never overlap.
+ */
+const HREF = /<a\s[^<>]*?href\s*=\s*"([^"]*)"/gi;
 const ENTITY = /&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi;
 const NAMED_ENTITIES: Record<string, string> = {
   amp: '&',
@@ -108,8 +112,12 @@ function toPrograms(maple: string[], mathematica: string[], program: string[]): 
 /** Schemes a link URL may carry; any other href (`javascript:`, `data:`, `mailto:`, …) is dropped. */
 const WEB_PROTOCOLS = new Set(['http:', 'https:']);
 
-/** An `href` attribute in any HTML quoting; the value lands in whichever group matched. */
-const HREF_ATTRIBUTE = /\s*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>][^\s>]*))/gi;
+/**
+ * An `href` attribute in any HTML quoting, with the whitespace before it; the value lands in
+ * whichever group matched. A match starts only at the beginning of a whitespace run, so a long run
+ * is scanned once rather than once per position.
+ */
+const HREF_ATTRIBUTE = /(?<!\s)\s*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>][^\s>]*))/gi;
 
 /** The absolute URL an href resolves to against oeis.org, when its scheme is `http:` or `https:`. */
 function toWebUrl(href: string): string | undefined {
@@ -131,6 +139,19 @@ export function stripNonWebHrefs(text: string): string {
   );
 }
 
+/** Removes each `<…>` span, from a `<` to the first `>` after it, in one pass over the text. */
+function stripTags(text: string): string {
+  let out = '';
+  let from = 0;
+  for (let open = text.indexOf('<'); open !== -1; open = text.indexOf('<', from)) {
+    const close = text.indexOf('>', open + 1);
+    if (close === -1) break;
+    out += text.slice(from, open);
+    from = close + 1;
+  }
+  return out + text.slice(from);
+}
+
 /** Decodes one link line: its text with tags stripped, and the absolute web URL of each href. */
 function toLink(line: string): SequenceLink {
   const urls: string[] = [];
@@ -138,7 +159,7 @@ function toLink(line: string): SequenceLink {
     const url = toWebUrl(match[1] ?? '');
     if (url) urls.push(url);
   }
-  return { text: stripNonWebHrefs(decodeEntities(line.replace(/<[^>]*>/g, ''))).trim(), urls };
+  return { text: stripNonWebHrefs(decodeEntities(stripTags(line))).trim(), urls };
 }
 
 function findBFileUrl(aNumber: string, links: SequenceLink[]): string | undefined {
@@ -164,7 +185,7 @@ function unrecognizedRecord(fields: readonly string[]): never {
 function firstIndexOf(aNumber: string, offset: string): number {
   const firstIndex = Number.parseInt(offset.split(',')[0] ?? '', 10);
   if (!Number.isFinite(firstIndex)) {
-    throw serviceUnavailable(`OEIS returned ${aNumber} with an unreadable offset "${offset}".`, {
+    throw serviceUnavailable(`OEIS returned ${aNumber} with an unreadable offset.`, {
       reason: 'upstream_unparseable',
       retryable: false,
     });

@@ -23,21 +23,21 @@ export const blankAsUnset = <T extends z.ZodType>(schema: T) =>
 /**
  * Normalizes A-number input to the zero-padded form: trims, decodes `%XX` escapes (a URL inside a
  * resource URI arrives percent-encoded, and template variables are not decoded), strips an oeis.org
- * URL prefix and anything after the A-number, uppercases a leading `a`, and pads `A?\d{1,7}` to six
- * digits (`A45` → `A000045`, `A0000045` → `A000045`). Anything else passes through to fail
- * validation.
+ * URL prefix, cuts at the first `/`, `?`, or `#` after the A-number, uppercases a leading `a`, and
+ * pads `A?\d{1,7}` to six digits (`A45` → `A000045`, `A0000045` → `A000045`). Anything else passes
+ * through to fail validation. Every step is linear in the input length, whatever the input holds.
  */
 export function normalizeANumber(value: unknown): unknown {
   if (typeof value !== 'string') return value;
-  const stripped = value
+  const unprefixed = value
     .trim()
     .replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) =>
       String.fromCharCode(Number.parseInt(hex, 16)),
     )
     .replace(/^https?:\/\//i, '')
-    .replace(/^(www\.)?oeis\.org\//i, '')
-    .replace(/[/?#].*$/, '')
-    .replace(/^a/, 'A');
+    .replace(/^(www\.)?oeis\.org\//i, '');
+  const end = unprefixed.search(/[/?#]/);
+  const stripped = (end === -1 ? unprefixed : unprefixed.slice(0, end)).replace(/^a/, 'A');
   const match = /^A?(\d{1,7})$/.exec(stripped);
   return match ? `A${String(Number(match[1])).padStart(6, '0')}` : value;
 }
