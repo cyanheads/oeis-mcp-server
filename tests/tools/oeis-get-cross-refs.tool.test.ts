@@ -1296,12 +1296,7 @@ describe('oeis_get_cross_refs', () => {
       const { result } = await crossRefs(
         { aNumber: 'A45' },
         record(withXref(['Cf. A000032 (Lucas), A001045.', 'Row sums of A011973.'])),
-        page(
-          batchPage('A000032', 'A001045', 'A011973').replace(
-            'Name of A011973.',
-            'Name of A011973.',
-          ),
-        ),
+        page(batchPage('A000032', 'A001045', 'A011973')),
       );
       const text = textOf(result);
       expect(text).toContain('# Sequences A000045 cross-references (start 0)');
