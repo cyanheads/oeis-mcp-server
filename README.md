@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>oeis-mcp-server</h1>
+  <h1>@cyanheads/oeis-mcp-server</h1>
   <p><b>Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs via MCP. STDIO or Streamable HTTP.</b>
   <div>6 Tools • 1 Resource</div>
   </p>
