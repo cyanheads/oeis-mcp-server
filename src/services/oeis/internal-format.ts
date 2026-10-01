@@ -5,7 +5,7 @@
  */
 
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { stripNonWebHrefs } from './normalize-record.js';
+import { isReservedEntry, splitList, stripNonWebHrefs } from './normalize-record.js';
 import type { SearchPage, SearchStatus, SequenceSummary } from './types.js';
 
 const SHOWING = /^Showing (\d+)-(\d+) of (\d+)$/;
@@ -44,27 +44,30 @@ function readStatus(line: string | undefined): {
   return formatChanged(`unknown status line "${trimmed.slice(0, 120)}"`);
 }
 
+function firstIndexOf(aNumber: string, offset: string): number {
+  const firstIndex = Number.parseInt(offset.split(',')[0] ?? '', 10);
+  if (!Number.isFinite(firstIndex)) {
+    formatChanged(`record ${aNumber} has an unreadable offset "${offset}"`);
+  }
+  return firstIndex;
+}
+
+/** One summary row. A reserved or recycled row has no `%O` line, so no offset or firstIndex. */
 function toSummary(aNumber: string, lines: RecordLines): SequenceSummary {
   if (lines.name === undefined) formatChanged(`record ${aNumber} has no %N line`);
-  if (lines.offset === undefined) formatChanged(`record ${aNumber} has no %O line`);
-  const firstIndex = Number.parseInt(lines.offset.split(',')[0] ?? '', 10);
-  if (!Number.isFinite(firstIndex)) {
-    formatChanged(`record ${aNumber} has an unreadable offset "${lines.offset}"`);
+  const keywords = splitList(lines.keywords ?? '');
+  if (lines.offset === undefined && !isReservedEntry(keywords)) {
+    formatChanged(`record ${aNumber} has no %O line`);
   }
   return {
     aNumber,
     name: stripNonWebHrefs(lines.name),
-    terms: lines.data
-      .join(',')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean),
-    offset: lines.offset,
-    firstIndex,
-    keywords: (lines.keywords ?? '')
-      .split(',')
-      .map((k) => k.trim())
-      .filter(Boolean),
+    terms: splitList(lines.data.join(',')),
+    ...(lines.offset !== undefined && {
+      offset: lines.offset,
+      firstIndex: firstIndexOf(aNumber, lines.offset),
+    }),
+    keywords,
     url: `https://oeis.org/${aNumber}`,
   };
 }

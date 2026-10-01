@@ -23,6 +23,7 @@ import {
   type RawRecord,
   recordBody,
   recordWith,
+  reservedSearchRecordText,
   type SearchFixtureRecord,
   searchPageText,
   signInRefusalBody,
@@ -235,6 +236,26 @@ describe('oeis_get_cross_refs', () => {
         'Name of A001045.',
         'Name of A011973.',
       ]);
+    });
+
+    it('resolves a page whose batch holds a reserved A-number with no %O line', async () => {
+      const body = searchPageText({
+        query: 'id:a000032|id:a397217',
+        status: 'Showing 1-2 of 2',
+        records: [summary('A000032'), reservedSearchRecordText('A397217')],
+      });
+      const { result } = await crossRefs(
+        { aNumber: 'A45' },
+        record(withXref(['Cf. A000032, A397217.'])),
+        page(body),
+      );
+      expect(result.isError).toBeUndefined();
+      expect(related(result)).toEqual([
+        expect.objectContaining({ aNumber: 'A000032', resolved: true, offset: '0,4' }),
+        expect.objectContaining({ aNumber: 'A397217', resolved: true, keywords: ['allocated'] }),
+      ]);
+      expect(related(result)[1]).not.toHaveProperty('offset');
+      expect(structured(result).notice).toBeUndefined();
     });
 
     it('ignores batch records it did not ask for', async () => {

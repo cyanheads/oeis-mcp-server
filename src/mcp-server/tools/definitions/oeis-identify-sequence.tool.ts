@@ -21,8 +21,11 @@ import type { SequenceSummary } from '@/services/oeis/types.js';
 const MINUS_SIGN = String.fromCodePoint(0x2212);
 const ELLIPSIS = String.fromCodePoint(0x2026);
 const BRACKET_PAIRS: Record<string, string> = { '[': ']', '(': ')', '{': '}' };
-const TERMS_PATTERN = /^(-?\d{1,200}|_)(,(-?\d{1,200}|_)){0,59}$/;
 const INTEGER = /^-?\d+$/;
+const MAX_TERMS = 60;
+const MAX_DIGITS = 200;
+/** OEIS takes a query of up to 1024 characters; this leaves room for the `signed:` prefix. */
+const MAX_QUERY_CHARS = 1000;
 
 /**
  * Normalizes a pasted run of terms to `t1,t2,…`: trims, strips one surrounding bracket pair and a
@@ -45,6 +48,29 @@ function normalizeTerms(value: unknown): unknown {
     .replace(/^,+|,+$/g, '');
 }
 
+/** The first rule a normalized run breaks, as a message for the caller; `undefined` when valid. */
+function brokenTermsRule(terms: string): string | undefined {
+  if (!terms) return 'no terms given; supply at least one integer, or _ for one unknown term.';
+  const tokens = terms.split(',');
+  if (tokens.length > MAX_TERMS) {
+    return `${tokens.length} terms given; at most ${MAX_TERMS} are accepted, and about 6 consecutive terms identify a sequence best.`;
+  }
+  for (const [i, token] of tokens.entries()) {
+    if (token !== '_' && !INTEGER.test(token)) {
+      const shown = token.length > 20 ? `${token.slice(0, 20)}${ELLIPSIS}` : token;
+      return `term ${i + 1} (${JSON.stringify(shown)}) is not an integer or _; give integers separated by commas or spaces.`;
+    }
+    const digits = token.replace('-', '').length;
+    if (digits > MAX_DIGITS) {
+      return `term ${i + 1} has ${digits} digits; each term may have at most ${MAX_DIGITS}.`;
+    }
+  }
+  if (terms.length > MAX_QUERY_CHARS) {
+    return `${terms.length} characters after normalizing; OEIS takes at most ${MAX_QUERY_CHARS}, so give fewer or shorter terms.`;
+  }
+  return;
+}
+
 /** A term as the matcher compares it: its absolute value unless signs must match. */
 function comparable(term: string, matchSigns: boolean): bigint {
   const value = BigInt(term);
@@ -60,6 +86,7 @@ function findMatchStartIndex(
   supplied: readonly string[],
   matchSigns: boolean,
 ): number | undefined {
+  if (row.firstIndex === undefined) return;
   const pattern = supplied.map((term) => (term === '_' ? undefined : comparable(term, matchSigns)));
   const data = row.terms.map((term) => (INTEGER.test(term) ? comparable(term, matchSigns) : null));
   for (let p = 0; p + pattern.length <= data.length; p++) {
@@ -105,13 +132,19 @@ function zeroHitNotice(supplied: readonly string[], matchSigns: boolean): string
 export const oeisIdentifySequence = tool('oeis_identify_sequence', {
   title: 'Identify OEIS Sequence',
   description:
-    'Identify integer sequences that contain a run of consecutive terms, e.g. "1, 2, 5, 14, 42". Returns up to 10 matches per page in OEIS relevance order, each with the index n at which the supplied run begins. For the best hit rate supply about 6 terms and leave off the first one or two, since sources disagree on where a sequence starts. Terms must be integers; wildcards _ (one unknown term) are allowed.',
+    'Identify integer sequences that contain a run of consecutive terms, e.g. "1, 2, 5, 14, 42". Returns up to 10 matches per page in OEIS relevance order, each with the index n at which the supplied run begins. For the best hit rate supply about 6 terms and leave off the first one or two, since sources disagree on where a sequence starts. Takes up to 60 terms, each an integer of at most 200 digits or the wildcard _ for one unknown term.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     terms: z
-      .preprocess(normalizeTerms, z.string().max(1000).regex(TERMS_PATTERN))
+      .preprocess(
+        normalizeTerms,
+        z.string().superRefine((terms, ctx) => {
+          const message = brokenTermsRule(terms);
+          if (message) ctx.addIssue({ code: 'custom', message });
+        }),
+      )
       .describe(
-        'Consecutive terms separated by commas or spaces, e.g. "1, 2, 5, 14, 42" (a bracketed list or a trailing ... is accepted). Use _ for a single unknown term.',
+        'Up to 60 consecutive terms separated by commas or spaces, e.g. "1, 2, 5, 14, 42" (a bracketed list or a trailing ... is accepted). Each term is an integer of at most 200 digits, or _ for a single unknown term.',
       ),
     matchSigns: blankAsUnset(z.boolean().default(false)).describe(
       'false (default) matches ignoring signs, so a sign-convention difference does not hide the sequence; true requires the signs to match.',

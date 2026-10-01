@@ -24,8 +24,8 @@ export const blankAsUnset = <T extends z.ZodType>(schema: T) =>
  * Normalizes A-number input to the zero-padded form: trims, decodes `%XX` escapes (a URL inside a
  * resource URI arrives percent-encoded, and template variables are not decoded), strips an oeis.org
  * URL prefix and anything after the A-number, uppercases a leading `a`, and pads `A?\d{1,7}` to six
- * digits (`A45` → `A000045`, `A0000045` → `A000045`). Anything else passes through to fail the
- * pattern.
+ * digits (`A45` → `A000045`, `A0000045` → `A000045`). Anything else passes through to fail
+ * validation.
  */
 export function normalizeANumber(value: unknown): unknown {
   if (typeof value !== 'string') return value;
@@ -42,9 +42,23 @@ export function normalizeANumber(value: unknown): unknown {
   return match ? `A${String(Number(match[1])).padStart(6, '0')}` : value;
 }
 
-/** The A-number input every tool and the resource take. */
+/**
+ * The A-number input every tool and the resource take. The shape is checked after normalization
+ * rather than advertised as a `pattern`, which would reject the short forms the description accepts.
+ */
 export const ANumberSchema = z
-  .preprocess(normalizeANumber, z.string().regex(/^A\d{6,7}$/))
+  .preprocess(
+    normalizeANumber,
+    z.string().superRefine((aNumber, ctx) => {
+      if (/^A\d{6,7}$/.test(aNumber)) return;
+      ctx.addIssue({
+        code: 'custom',
+        message: /^\s*[MN]\d{1,4}\s*$/i.test(aNumber)
+          ? 'a legacy M/N book number is not an A-number; search it as a word with oeis_search_sequences to find the entry.'
+          : 'expected an OEIS A-number such as A000045 (A45, 45, and an oeis.org sequence URL are also accepted).',
+      });
+    }),
+  )
   .describe(
     'OEIS A-number, e.g. "A000045"; oeis_identify_sequence and oeis_search_sequences return them. Also accepts "a000045", "A45", "45", and an oeis.org sequence URL; all normalize to the zero-padded form. Legacy M/N book numbers (e.g. "M1459") are not A-numbers: find them with oeis_search_sequences.',
   );
@@ -63,10 +77,14 @@ export const SequenceSummarySchema = z.object({
   terms: z.array(z.string()).describe('Data-line terms as exact decimal strings, signs kept.'),
   offset: z
     .string()
+    .optional()
     .describe(
-      'Offset "i,p": i is the index n of the first term, p the 1-based position of the first term with |a(n)| > 1.',
+      'Offset "i,p": i is the index n of the first term, p the 1-based position of the first term with |a(n)| > 1. Absent on a reserved or recycled A-number (keyword allocated or recycled).',
     ),
-  firstIndex: z.number().describe('The index n of the first term (the first number of offset).'),
+  firstIndex: z
+    .number()
+    .optional()
+    .describe('The index n of the first term (the first number of offset); absent with offset.'),
   keywords: z
     .array(z.string())
     .describe(

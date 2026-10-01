@@ -79,7 +79,7 @@ function zeroHitNotice(query: string): string {
   }
   if (NUMBERS_ONLY.test(query)) {
     parts.push(
-      'For a run of terms, oeis_identify_sequence reports where the run starts and can ignore signs.',
+      'Drop the first term or two and retry, since sources disagree on where a sequence starts; or put subseq: before the terms to match them with other terms in between.',
     );
   }
   if (!parts.length) {

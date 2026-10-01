@@ -62,6 +62,22 @@ export const minimalRecordJson: RawRecord = {
   created: '2026-09-28T08:00:00-04:00',
 };
 
+/**
+ * A reserved A-number as OEIS serves it (keyword `allocated`): an empty data line and no `offset`
+ * field at all.
+ */
+export const reservedRecordJson: RawRecord = {
+  number: 397217,
+  data: '',
+  name: 'allocated for Jane Doe',
+  keyword: 'allocated',
+  author: 'Jane Doe',
+  references: 1,
+  revision: 1,
+  time: '2026-09-29T12:00:00-04:00',
+  created: '2026-09-29T12:00:00-04:00',
+};
+
 /** Returns `base` with `overrides` applied; a key set to `undefined` is removed. */
 export function recordWith(overrides: RawRecord, base: RawRecord = fibonacciRecordJson): RawRecord {
   const next: RawRecord = { ...base, ...overrides };
@@ -151,15 +167,30 @@ const GREETING = '# Greetings from The On-Line Encyclopedia of Integer Sequences
 const LICENSE =
   '# Content is available under The OEIS End-User License Agreement: http://oeis.org/LICENSE';
 
-/** Renders a complete `fmt=text` page: greeting, `Search:` echo, status line, records, license. */
+/** A reserved A-number's record in the internal format: `%N` and `%K` only, no `%S` and no `%O`. */
+export function reservedSearchRecordText(aNumber = 'A397217'): string {
+  return [
+    `%I ${aNumber} #1 Sep 29 2026 12:00:00`,
+    `%N ${aNumber} allocated for Jane Doe`,
+    `%K ${aNumber} allocated`,
+    `%A ${aNumber} Jane Doe, Sep 29 2026`,
+  ].join('\n');
+}
+
+/**
+ * Renders a complete `fmt=text` page: greeting, `Search:` echo, status line, records, license. A
+ * string record is inserted as already-rendered internal-format text.
+ */
 export function searchPageText(options: {
   eol?: '\n' | '\r\n';
   query: string;
-  records?: SearchFixtureRecord[];
+  records?: (SearchFixtureRecord | string)[];
   status: string;
 }): string {
   const { eol = '\n', query, records = [], status } = options;
-  const body = records.map(searchRecordText).join('\n\n');
+  const body = records
+    .map((record) => (typeof record === 'string' ? record : searchRecordText(record)))
+    .join('\n\n');
   const lines = [GREETING, '', `Search: ${query}`, status, ''];
   if (body) lines.push(body, '');
   lines.push(LICENSE, '');
@@ -238,6 +269,19 @@ export const signInRefusalBody = 'Sign in to see search results past the first 1
 export function bFileText(terms: readonly string[], firstIndex = 0): string {
   const header = ['# Table of n, a(n) for n = 0..1000', '# synthetic fixture', ''];
   return `${[...header, ...terms.map((value, i) => `${firstIndex + i} ${value}`)].join('\n')}\n`;
+}
+
+/**
+ * What OEIS answers, with `200`, at the b-file path of an entry that has no b-file: the data line
+ * under a marker first line. A reserved A-number's file is the marker line alone (51 bytes).
+ */
+export function synthesizedBFile(
+  aNumber: string,
+  terms: readonly string[],
+  firstIndex = 0,
+): string {
+  const pairs = terms.map((value, i) => `${firstIndex + i} ${value}`);
+  return `${[`# ${aNumber} (b-file synthesized from sequence entry)`, ...pairs].join('\n')}\n`;
 }
 
 /** First 15 Fibonacci numbers as a complete b-file (28 + header bytes). */

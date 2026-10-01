@@ -7,6 +7,7 @@
  * @module tests/tools/oeis-identify-sequence.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { createPacer } from '@cyanheads/mcp-ts-core/utils';
@@ -184,6 +185,70 @@ describe('oeis_identify_sequence', () => {
       expect(parsedTerms(`[ ${padded} , ... ]`).split(',')).toHaveLength(60);
     });
 
+    it('measures the 1000-character limit on the normalized run, not on the pasted text', () => {
+      const fourLong = Array.from({ length: 4 }, () => '9'.repeat(200)).join(' ,   \n ');
+      expect(fourLong.length).toBeLessThan(1000);
+      const spaced = `[ ${fourLong} , ${' '.repeat(300)}... ]`;
+      expect(spaced.length).toBeGreaterThan(1000);
+      expect(parsedTerms(spaced).split(',')).toHaveLength(4);
+    });
+
+    it('advertises terms as a plain string, so the example in its description is valid', () => {
+      const terms = z.toJSONSchema(oeisIdentifySequence.input, {
+        io: 'input',
+        unrepresentable: 'any',
+      }).properties?.terms;
+      expect(terms).toMatchObject({ type: 'string' });
+      expect(terms).not.toHaveProperty('pattern');
+      expect(terms).not.toHaveProperty('maxLength');
+      expect(oeisIdentifySequence.input.shape.terms.description).toContain('60');
+    });
+
+    const messagesFor = (terms: string) =>
+      oeisIdentifySequence.input.safeParse({ terms }).error?.issues.map((issue) => issue.message);
+    const sixtyOne = Array.from({ length: 61 }, (_, i) => String(i + 1)).join(', ');
+    const sixLong = Array.from({ length: 6 }, () => '9'.repeat(200)).join(',');
+
+    it.each([
+      [
+        'an empty run',
+        ',,,',
+        'no terms given; supply at least one integer, or _ for one unknown term.',
+      ],
+      [
+        '61 terms',
+        sixtyOne,
+        '61 terms given; at most 60 are accepted, and about 6 consecutive terms identify a sequence best.',
+      ],
+      [
+        'a decimal',
+        '1, 1.5, 2',
+        'term 2 ("1.5") is not an integer or _; give integers separated by commas or spaces.',
+      ],
+      [
+        'a semicolon separator',
+        '1; 2; 3',
+        'term 1 ("1;") is not an integer or _; give integers separated by commas or spaces.',
+      ],
+      [
+        'a long non-integer token, cut in the message',
+        `1, ${'x'.repeat(50)}`,
+        `term 2 ("${'x'.repeat(20)}…") is not an integer or _; give integers separated by commas or spaces.`,
+      ],
+      [
+        'a 201-digit term',
+        `1, -${'9'.repeat(201)}`,
+        'term 2 has 201 digits; each term may have at most 200.',
+      ],
+      [
+        'a run over 1000 characters',
+        sixLong,
+        '1205 characters after normalizing; OEIS takes at most 1000, so give fewer or shorter terms.',
+      ],
+    ])('rejects %s with one message naming the rule', (_label, terms, message) => {
+      expect(messagesFor(terms)).toEqual([message]);
+    });
+
     it('answers a rejected terms with invalid_arguments and no request', async () => {
       const { calls, result } = await identify({ terms: 'a, b' }, page(resultsSearchPage));
       expect(result.isError).toBe(true);
@@ -192,6 +257,11 @@ describe('oeis_identify_sequence', () => {
         data: { reason: 'invalid_arguments' },
       });
       expect(calls).toHaveLength(0);
+    });
+
+    it('carries the rule broken into content[]', async () => {
+      const { result } = await identify({ terms: sixtyOne }, page(resultsSearchPage));
+      expect(textOf(result)).toContain('terms: 61 terms given; at most 60 are accepted');
     });
   });
 

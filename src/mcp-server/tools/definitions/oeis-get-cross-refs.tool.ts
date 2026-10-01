@@ -133,12 +133,12 @@ const RelatedSchema = z
       .string()
       .optional()
       .describe(
-        'Offset "i,p": i is the index n of the first term, p the 1-based position of the first term with |a(n)| > 1. Absent when not resolved.',
+        'Offset "i,p": i is the index n of the first term, p the 1-based position of the first term with |a(n)| > 1. Absent when not resolved, and on a reserved or recycled A-number (keyword allocated or recycled).',
       ),
     firstIndex: z
       .number()
       .optional()
-      .describe('The index n of the first term; absent when not resolved.'),
+      .describe('The index n of the first term; absent with offset.'),
     keywords: z
       .array(z.string())
       .optional()

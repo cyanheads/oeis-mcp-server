@@ -30,6 +30,7 @@ import {
   recordWith,
   resultsSearchPage,
   signInRefusalBody,
+  synthesizedBFile,
   tooManySearchPage,
 } from '../../fixtures/oeis-upstream.js';
 import { type FetchStep, hangingFetch, res, scriptedFetch } from '../../fixtures/scripted-fetch.js';
@@ -798,6 +799,35 @@ describe('OeisService.getBFile', () => {
       await expect(h.service.getBFile('A388000', ctx)).resolves.toEqual({ status: 'missing' });
       await expect(h.service.getBFile('A388000', ctx)).resolves.toEqual({ status: 'missing' });
       expect(h.fetchCalls).toHaveLength(1);
+    });
+
+    it('reads a file OEIS synthesized from the data line as missing, and caches that', async () => {
+      const h = harness([res(synthesizedBFile('A181630', ['1', '1', '2', '5']), { status: 200 })]);
+      await expect(h.service.getBFile('A181630', ctx)).resolves.toEqual({ status: 'missing' });
+      await expect(h.service.getBFile('A181630', ctx)).resolves.toEqual({ status: 'missing' });
+      expect(h.fetchCalls).toHaveLength(1);
+    });
+
+    it('reads the marker-only file of a reserved A-number as missing, on a 206 too', async () => {
+      const body = synthesizedBFile('A397217', []);
+      expect(body).toHaveLength(51);
+      const h = harness([
+        res(body, { status: 206, headers: { 'content-range': 'bytes 0-50/51' } }),
+      ]);
+      await expect(h.service.getBFile('A397217', ctx)).resolves.toEqual({ status: 'missing' });
+    });
+
+    it('reads a b-file as one when the marker phrase is not its first line', async () => {
+      const body =
+        '# Table of n, a(n)\n# A000045 (b-file synthesized from sequence entry)\n0 0\n1 1\n';
+      const h = harness([res(body, { status: 200 })]);
+      await expect(h.service.getBFile('A000045', ctx)).resolves.toMatchObject({
+        status: 'ok',
+        terms: [
+          { n: 0, value: '0' },
+          { n: 1, value: '1' },
+        ],
+      });
     });
 
     it('caches reads for 7 days, then refetches', async () => {

@@ -18,9 +18,12 @@ export interface CacheEntry<V> {
  */
 export class LruCache<V> {
   private readonly entries = new Map<string, CacheEntry<V>>();
+  private readonly maxBytes: number;
   private totalBytes = 0;
 
-  constructor(private readonly maxBytes: number) {}
+  constructor(maxBytes: number) {
+    this.maxBytes = maxBytes;
+  }
 
   /** Returns the entry (fresh or stale) and marks it most recently used. */
   get(key: string): CacheEntry<V> | undefined {

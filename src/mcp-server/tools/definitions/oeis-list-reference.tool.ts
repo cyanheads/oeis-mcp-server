@@ -7,7 +7,8 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { inline } from '@/mcp-server/shared/markdown.js';
 
-type Topic = 'keywords' | 'search_syntax' | 'identifiers';
+const TOPICS = ['keywords', 'search_syntax', 'identifiers'] as const;
+type Topic = (typeof TOPICS)[number];
 
 interface ReferenceEntry {
   description: string;
@@ -239,7 +240,7 @@ export const oeisListReference = tool('oeis_list_reference', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     topic: z
-      .enum(['keywords', 'search_syntax', 'identifiers'])
+      .enum(TOPICS)
       .describe(
         'keywords: keyword flags such as nonn, core, tabl. search_syntax: prefixes, operators, wildcards, sort orders, and paging. identifiers: A-numbers, legacy M/N numbers, offsets, and b-files.',
       ),

@@ -28,11 +28,18 @@ export function fence(code: string): string {
   return `${marker}\n${code}\n${marker}`;
 }
 
+/** The offset line of an entry or row; a reserved or recycled A-number has no offset. */
+export function offsetLine(offset: string | undefined, firstIndex: number | undefined): string {
+  return offset === undefined || firstIndex === undefined
+    ? '**Offset:** none (reserved or recycled A-number)'
+    : `**Offset:** ${inline(offset)} (first term is a(${firstIndex}))`;
+}
+
 /** Renders the detail lines of one summary row (terms, offset, keywords, URL). */
 export function summaryLines(row: z.infer<typeof SequenceSummarySchema>): string[] {
   return [
     `**Terms:** ${row.terms.length ? inline(row.terms.join(', ')) : 'none listed'}`,
-    `**Offset:** ${inline(row.offset)} (first term is a(${row.firstIndex}))`,
+    offsetLine(row.offset, row.firstIndex),
     `**Keywords:** ${row.keywords.length ? inline(row.keywords.join(', ')) : 'none'}`,
     `**URL:** ${row.url}`,
   ];

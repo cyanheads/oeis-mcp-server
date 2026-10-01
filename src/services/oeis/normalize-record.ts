@@ -27,7 +27,7 @@ const RawRecordSchema = z.object({
   xref: lines,
   ext: lines,
   keyword: z.string(),
-  offset: z.string(),
+  offset: z.string().optional(),
   author: z.string().optional(),
   references: z.number().int(),
   revision: z.number().int(),
@@ -47,6 +47,14 @@ const NAMED_ENTITIES: Record<string, string> = {
   apos: "'",
 };
 
+/** Keywords of a reserved or recycled A-number, which OEIS publishes without an offset. */
+const RESERVED_KEYWORDS = new Set(['allocated', 'recycled']);
+
+/** True when the keyword flags mark a reserved or recycled A-number. */
+export function isReservedEntry(keywords: readonly string[]): boolean {
+  return keywords.some((keyword) => RESERVED_KEYWORDS.has(keyword));
+}
+
 /** Formats an OEIS sequence number as its zero-padded A-number (`45` → `A000045`). */
 export function toANumber(n: number): string {
   return `A${String(n).padStart(6, '0')}`;
@@ -63,7 +71,8 @@ function decodeEntities(text: string): string {
   });
 }
 
-function splitList(value: string): string[] {
+/** Splits a comma-separated upstream list (terms, keywords), trimming and dropping empty items. */
+export function splitList(value: string): string[] {
   return value
     .split(',')
     .map((v) => v.trim())
@@ -143,34 +152,44 @@ function findBFileUrl(aNumber: string, links: SequenceLink[]): string | undefine
   return pointsAtBFile ? `${OEIS_ORIGIN}${path}` : undefined;
 }
 
+/** The non-retryable "format changed" failure, naming the fields that did not validate. */
+function unrecognizedRecord(fields: readonly string[]): never {
+  throw serviceUnavailable(
+    `OEIS returned a sequence record in an unrecognized format (fields: ${fields.join(', ')}).`,
+    { reason: 'upstream_unparseable', retryable: false },
+  );
+}
+
+/** The index n of the first term: the first integer of the offset `"i,p"`. */
+function firstIndexOf(aNumber: string, offset: string): number {
+  const firstIndex = Number.parseInt(offset.split(',')[0] ?? '', 10);
+  if (!Number.isFinite(firstIndex)) {
+    throw serviceUnavailable(`OEIS returned ${aNumber} with an unreadable offset "${offset}".`, {
+      reason: 'upstream_unparseable',
+      retryable: false,
+    });
+  }
+  return firstIndex;
+}
+
 /**
- * Normalizes a parsed `/A######?fmt=json` body.
+ * Normalizes a parsed `/A######?fmt=json` body. A reserved or recycled A-number (keyword
+ * `allocated` or `recycled`) has no `offset`, so its record carries neither `offset` nor
+ * `firstIndex`.
  *
  * @throws {McpError} `ServiceUnavailable` with `reason: 'upstream_unparseable'` and
- *   `retryable: false` when the object lacks a field every OEIS record carries — the record
- *   format changed, and asking again returns the same body.
+ *   `retryable: false` when the object lacks a field every OEIS record carries (or an ordinary
+ *   record lacks its offset) — the record format changed, and asking again returns the same body.
  */
 export function normalizeRecord(body: Record<string, unknown>): SequenceRecord {
   const parsed = RawRecordSchema.safeParse(body);
   if (!parsed.success) {
-    const fields = [...new Set(parsed.error.issues.map((i) => i.path.join('.') || '(root)'))];
-    throw serviceUnavailable(
-      `OEIS returned a sequence record in an unrecognized format (fields: ${fields.join(', ')}).`,
-      { reason: 'upstream_unparseable', retryable: false },
-    );
+    unrecognizedRecord([...new Set(parsed.error.issues.map((i) => i.path.join('.') || '(root)'))]);
   }
   const raw = parsed.data;
   const aNumber = toANumber(raw.number);
-  const firstIndex = Number.parseInt(raw.offset.split(',')[0] ?? '', 10);
-  if (!Number.isFinite(firstIndex)) {
-    throw serviceUnavailable(
-      `OEIS returned ${aNumber} with an unreadable offset "${raw.offset}".`,
-      {
-        reason: 'upstream_unparseable',
-        retryable: false,
-      },
-    );
-  }
+  const keywords = splitList(raw.keyword);
+  if (raw.offset === undefined && !isReservedEntry(keywords)) unrecognizedRecord(['offset']);
   const links = (raw.link ?? []).map(toLink);
   const text = (values: string[] | undefined) => (values ?? []).map(stripNonWebHrefs);
   const author = raw.author && stripNonWebHrefs(raw.author).trim();
@@ -181,9 +200,11 @@ export function normalizeRecord(body: Record<string, unknown>): SequenceRecord {
     aNumber,
     name: stripNonWebHrefs(raw.name),
     terms: splitList(raw.data),
-    offset: raw.offset,
-    firstIndex,
-    keywords: splitList(raw.keyword),
+    ...(raw.offset !== undefined && {
+      offset: raw.offset,
+      firstIndex: firstIndexOf(aNumber, raw.offset),
+    }),
+    keywords,
     ...(author && { author }),
     ...(legacyIds.length > 0 && { legacyIds }),
     referenceCount: raw.references,

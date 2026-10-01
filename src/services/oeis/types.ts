@@ -7,14 +7,14 @@
 export interface SequenceSummary {
   /** Zero-padded A-number, e.g. `A000108`. */
   aNumber: string;
-  /** First integer of `offset`: the index n of the first term. */
-  firstIndex: number;
+  /** First integer of `offset`: the index n of the first term. Absent with `offset`. */
+  firstIndex?: number;
   /** Keyword flags from `%K`. */
   keywords: string[];
   /** Sequence name from `%N`. */
   name: string;
-  /** Offset line from `%O`, e.g. `"0,3"`. */
-  offset: string;
+  /** Offset line from `%O`, e.g. `"0,3"`; absent on a reserved or recycled A-number. */
+  offset?: string;
   /** Data-line terms (`%S`+`%T`+`%U`), signed values kept, as decimal strings. */
   terms: string[];
   /** Canonical sequence page URL. */
@@ -105,12 +105,14 @@ export interface SequenceCore {
   /** Absolute b-file URL when a `link` line points at `/A######/b######.txt`. */
   bFileUrl?: string;
   created?: string;
-  firstIndex: number;
+  /** First integer of `offset`: the index n of the first term. Absent with `offset`. */
+  firstIndex?: number;
   keywords: string[];
   legacyIds?: string[];
   modified?: string;
   name: string;
-  offset: string;
+  /** Offset `"i,p"`; absent on a reserved or recycled A-number, which OEIS publishes without one. */
+  offset?: string;
   /** Entries mentioning this A-number, the entry itself included. */
   referenceCount: number;
   revision: number;
@@ -138,6 +140,7 @@ export type BFileRead =
       /** Parsed pairs in file order; `#` comments and non-matching lines skipped. */
       terms: BFileTerm[];
     }
+  /** The entry has no b-file: a `404`, or a file OEIS synthesized from the data line. */
   | { status: 'missing' };
 
 /** Per-call options shared by the service's upstream methods. */

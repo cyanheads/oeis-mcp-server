@@ -7,8 +7,9 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatOutline, outlineOnOverflow, selectSections } from '@cyanheads/mcp-ts-core/utils';
-import { blockquote, fence, inline } from '@/mcp-server/shared/markdown.js';
+import { blockquote, fence, inline, offsetLine } from '@/mcp-server/shared/markdown.js';
 import { ANumberSchema, blankAsUnset } from '@/mcp-server/shared/oeis-schemas.js';
+import { isReservedEntry } from '@/services/oeis/normalize-record.js';
 import { getOeisService } from '@/services/oeis/oeis-service.js';
 import { SECTION_NAMES, type SectionName, type SequenceRecord } from '@/services/oeis/types.js';
 
@@ -39,10 +40,14 @@ const SequenceOutputSchema = z.object({
     .describe('Data-line terms as exact decimal strings, signs kept; the first is a(firstIndex).'),
   offset: z
     .string()
+    .optional()
     .describe(
-      'Offset "i,p": i is the index n of the first term, p the 1-based position of the first term with |a(n)| > 1.',
+      'Offset "i,p": i is the index n of the first term, p the 1-based position of the first term with |a(n)| > 1. Absent on a reserved or recycled A-number (keyword allocated or recycled).',
     ),
-  firstIndex: z.number().describe('The index n of the first term (the first number of offset).'),
+  firstIndex: z
+    .number()
+    .optional()
+    .describe('The index n of the first term (the first number of offset); absent with offset.'),
   keywords: z
     .array(z.string())
     .describe(
@@ -167,7 +172,7 @@ function lifecycleNotice(keywords: readonly string[]): string | undefined {
   if (keywords.includes('dead')) {
     return 'This entry is withdrawn (keyword dead); its name gives the reason and usually the replacement A-number — pass that to oeis_get_sequence.';
   }
-  if (keywords.includes('allocated') || keywords.includes('recycled')) {
+  if (isReservedEntry(keywords)) {
     return 'This A-number is reserved or recycled and has no published sequence yet.';
   }
   return;
@@ -186,8 +191,8 @@ function codeSpan(text: string): string {
 }
 
 /** Renders a line section as one blockquote per line, or "None." when the entry has no lines. */
-function quotedLines(heading: string, lines: readonly string[]): string[] {
-  return [`## ${heading}`, lines.length ? lines.map(blockquote).join('\n\n') : 'None.'];
+function quotedLines(heading: string, lines: readonly string[]): string {
+  return `## ${heading}\n\n${lines.length ? lines.map(blockquote).join('\n\n') : 'None.'}`;
 }
 
 export const oeisGetSequence = tool('oeis_get_sequence', {
@@ -256,7 +261,7 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
       '',
       `**Kind:** ${result.kind}`,
       `**Terms:** ${result.terms.length ? inline(result.terms.join(', ')) : 'none listed'}`,
-      `**Offset:** ${inline(result.offset)} (first term is a(${result.firstIndex}))`,
+      offsetLine(result.offset, result.firstIndex),
       `**Keywords:** ${result.keywords.length ? inline(result.keywords.join(', ')) : 'none'}`,
     ];
     if (result.author) lines.push(`**Author:** ${inline(result.author)}`);
@@ -271,8 +276,8 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
     if (result.bFileUrl) lines.push(`**b-file:** ${inline(result.bFileUrl)}`);
 
     const blocks: string[] = [lines.join('\n')];
-    if (result.comments) blocks.push(quotedLines('Comments', result.comments).join('\n\n'));
-    if (result.formulas) blocks.push(quotedLines('Formulas', result.formulas).join('\n\n'));
+    if (result.comments) blocks.push(quotedLines('Comments', result.comments));
+    if (result.formulas) blocks.push(quotedLines('Formulas', result.formulas));
     if (result.examples) {
       blocks.push(
         ['## Examples', result.examples.length ? fence(result.examples.join('\n')) : 'None.'].join(
@@ -289,7 +294,7 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
         ['## Programs', ...(programBlocks.length ? programBlocks : ['None.'])].join('\n\n'),
       );
     }
-    if (result.references) blocks.push(quotedLines('References', result.references).join('\n\n'));
+    if (result.references) blocks.push(quotedLines('References', result.references));
     if (result.links) {
       const linkLines = result.links.map(
         (link) =>
@@ -298,9 +303,9 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
       blocks.push(['## Links', linkLines.length ? linkLines.join('\n') : 'None.'].join('\n\n'));
     }
     if (result.crossReferences) {
-      blocks.push(quotedLines('Cross-references', result.crossReferences).join('\n\n'));
+      blocks.push(quotedLines('Cross-references', result.crossReferences));
     }
-    if (result.extensions) blocks.push(quotedLines('Extensions', result.extensions).join('\n\n'));
+    if (result.extensions) blocks.push(quotedLines('Extensions', result.extensions));
 
     const content = [{ type: 'text' as const, text: blocks.join('\n\n') }];
     if (result.sections) {

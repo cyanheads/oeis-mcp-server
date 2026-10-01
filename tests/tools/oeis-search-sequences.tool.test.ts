@@ -18,6 +18,7 @@ import {
   htmlMaintenanceBody,
   moebiusSearchRecord,
   noResultsSearchPage,
+  reservedSearchRecordText,
   resultsSearchPage,
   searchPageText,
   signInRefusalBody,
@@ -329,7 +330,7 @@ describe('oeis_search_sequences', () => {
       'Loosen the query: drop a prefix filter or a quoted phrase, or use | between alternatives.';
     const SYNTAX = 'oeis_list_reference topic search_syntax lists the valid prefixes.';
     const NUMBERS =
-      'For a run of terms, oeis_identify_sequence reports where the run starts and can ignore signs.';
+      'Drop the first term or two and retry, since sources disagree on where a sequence starts; or put subseq: before the terms to match them with other terms in between.';
 
     it('answers an ordinary miss with the loosening advice alone', async () => {
       expect(await noticeFor({ query: 'zzzz qqqq' })).toBe(LOOSEN);
@@ -375,7 +376,7 @@ describe('oeis_search_sequences', () => {
     });
 
     it.each(['1,2,3', '1 2 3', '-1, 2, -3', '42'])(
-      'points a numbers-only query %j at oeis_identify_sequence',
+      'answers a numbers-only query %j with term-run advice, not a pointer to identify',
       async (query) => {
         expect(await noticeFor({ query })).toBe(NUMBERS);
       },
@@ -702,6 +703,23 @@ describe('oeis_search_sequences', () => {
       const text = textOf(result);
       expect(text).toContain('**Terms:** none listed');
       expect(text).toContain('**Keywords:** none');
+    });
+
+    it('lists a reserved row, which has no %O offset, beside ordinary rows instead of failing the page', async () => {
+      const body = searchPageText({
+        query: 'keyword:allocated',
+        status: 'Showing 1-2 of 2',
+        records: [moebiusSearchRecord, reservedSearchRecordText()],
+      });
+      const { result } = await search({ query: 'keyword:allocated', sort: 'created' }, page(body));
+      expect(result.isError).toBeUndefined();
+      expect(rows(result).map((row) => row.aNumber)).toEqual(['A008683', 'A397217']);
+      expect(rows(result)[1]).toMatchObject({ terms: [], keywords: ['allocated'] });
+      expect(rows(result)[1]).not.toHaveProperty('offset');
+      expect(rows(result)[1]).not.toHaveProperty('firstIndex');
+      const text = textOf(result);
+      expect(text).toContain('**Offset:** 1,1 (first term is a(1))');
+      expect(text).toContain('**Offset:** none (reserved or recycled A-number)');
     });
   });
 

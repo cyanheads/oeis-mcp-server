@@ -24,6 +24,8 @@ import {
   type RawRecord,
   recordBody,
   recordWith,
+  reservedRecordJson,
+  synthesizedBFile,
 } from '../fixtures/oeis-upstream.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, serviceOver, withBackoff } from '../fixtures/tool-service.js';
@@ -456,6 +458,89 @@ describe('oeis_get_terms', () => {
     });
   });
 
+  describe('byte budget', () => {
+    const BUDGET = 100_000;
+    const wireBytes = (result: Result) =>
+      new TextEncoder().encode(
+        JSON.stringify(result.structuredContent) + JSON.stringify(result.content),
+      ).length;
+    const thousandDigitTerms = () =>
+      bFile(bFileText(Array.from({ length: 300 }, (_, i) => `${i + 1}`.padEnd(1000, '7'))));
+
+    it('stops a slice of large terms within 100,000 bytes and continues from the first term left out', async () => {
+      const { result } = await getTerms({ aNumber: 'A45', limit: 1000 }, thousandDigitTerms());
+      const shown = terms(result).length;
+      expect(shown).toBeGreaterThan(1);
+      expect(shown).toBeLessThan(100);
+      expect(ns(result)).toEqual(Array.from({ length: shown }, (_, i) => i));
+      expect(wireBytes(result)).toBeLessThanOrEqual(BUDGET);
+      expect(structured(result)).toMatchObject({
+        nextFromIndex: shown,
+        truncated: true,
+        shown,
+        cap: 1000,
+      });
+      expect(structured(result).notice).toBe(
+        `Stopped after ${shown} terms to stay within the 100,000-byte response budget; call again with fromIndex ${shown}.`,
+      );
+
+      const { result: rest } = await getTerms(
+        { aNumber: 'A45', fromIndex: shown, limit: 1000 },
+        thousandDigitTerms(),
+      );
+      expect(ns(rest)[0]).toBe(shown);
+      expect(wireBytes(rest)).toBeLessThanOrEqual(BUDGET);
+    });
+
+    it('holds the budget with the longest notices, URL, and indices the schema allows', async () => {
+      const base = Number.MAX_SAFE_INTEGER - 2000;
+      // Terms of ~260 bytes each fill the slice to within one term of the budget's term share.
+      const body = bFileText(
+        Array.from({ length: 500 }, () => `-${'9'.repeat(99)}`),
+        base,
+      );
+      const { result } = await getTerms(
+        { aNumber: 'A1234567', limit: 1000 },
+        bFilePartial(body, Number.MAX_SAFE_INTEGER),
+      );
+      expect(structured(result)).toMatchObject({
+        bFileCut: true,
+        bFileSizeInBytes: Number.MAX_SAFE_INTEGER,
+        bFileUrl: 'https://oeis.org/A1234567/b1234567.txt',
+        truncated: true,
+      });
+      expect(structured(result).notice).toMatch(/^Only the first 1 MiB .* Stopped after \d+ terms/);
+      expect(wireBytes(result)).toBeGreaterThan(BUDGET - 5_000);
+      expect(wireBytes(result)).toBeLessThanOrEqual(BUDGET);
+    });
+
+    it('holds the budget at the default limit too', async () => {
+      const { result } = await getTerms({ aNumber: 'A45' }, thousandDigitTerms());
+      expect(terms(result).length).toBeLessThan(100);
+      expect(wireBytes(result)).toBeLessThanOrEqual(BUDGET);
+    });
+
+    it('returns a single term larger than the budget on its own and points at the next', async () => {
+      const huge = '9'.repeat(120_000);
+      const { result } = await getTerms(
+        { aNumber: 'A45', fromIndex: 1 },
+        bFile(bFileText(['1', huge, '2'])),
+      );
+      expect(terms(result)).toEqual([{ n: 1, value: huge }]);
+      expect(structured(result)).toMatchObject({ nextFromIndex: 2, truncated: true, shown: 1 });
+      expect(structured(result).notice).toBe(
+        'Stopped after 1 term to stay within the 100,000-byte response budget; call again with fromIndex 2.',
+      );
+    });
+
+    it('leaves a slice of small terms to limit alone', async () => {
+      const small = bFile(bFileText(Array.from({ length: 1200 }, (_, i) => String(i * 7))));
+      const { result } = await getTerms({ aNumber: 'A45', limit: 1000 }, small);
+      expect(terms(result)).toHaveLength(1000);
+      expect(structured(result).notice).toBe('More terms follow; call again with fromIndex 1000.');
+    });
+  });
+
   describe('data-line fallback', () => {
     it('falls back to the record when the b-file answers 404, indexing from firstIndex', async () => {
       const { calls, result } = await getTerms(
@@ -488,6 +573,43 @@ describe('oeis_get_terms', () => {
       expect(structured(result).notice).toBe(
         'This entry has no b-file; these are the data-line terms only.',
       );
+    });
+
+    it('treats a b-file OEIS synthesized from the data line as no b-file', async () => {
+      const { calls, result } = await getTerms(
+        { aNumber: 'A388000' },
+        bFile(synthesizedBFile('A388000', ['1', '2', '3'], 1)),
+        record(minimalRecordJson),
+      );
+      expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+        '/A388000/b388000.txt',
+        '/A388000',
+      ]);
+      expect(structured(result)).toMatchObject({
+        source: 'data',
+        firstAvailableIndex: 1,
+        lastAvailableIndex: 3,
+        bFileCut: false,
+      });
+      expect(structured(result)).not.toHaveProperty('bFileUrl');
+      expect(structured(result)).not.toHaveProperty('bFileSizeInBytes');
+      expect(structured(result).notice).toBe(
+        'This entry has no b-file; these are the data-line terms only.',
+      );
+    });
+
+    it('answers the same for an entry without a b-file whether or not its record is cached', async () => {
+      const { service, calls } = serviceOver(
+        bFile(synthesizedBFile('A388000', ['1', '2', '3'], 1)),
+        record(minimalRecordJson),
+      );
+      holder.service = service;
+      const cold = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      await service.getRecord('A388000', createMockContext());
+      const warm = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      expect(structured(cold)).toMatchObject({ source: 'data' });
+      expect(structured(warm)).toEqual(structured(cold));
+      expect(calls).toHaveLength(2);
     });
 
     it('slices the data-line terms like b-file terms', async () => {
@@ -597,6 +719,29 @@ describe('oeis_get_terms', () => {
       expect(structured(result)).not.toHaveProperty('lastAvailableIndex');
       expect(structured(result)).not.toHaveProperty('nextFromIndex');
       expect(structured(result)).toMatchObject({ source: 'data', truncated: false, shown: 0 });
+      expect(structured(result).notice).toBe(
+        'OEIS publishes no terms for this entry. This entry has no b-file; these are the data-line terms only.',
+      );
+    });
+
+    it('reads a reserved A-number: its marker-only b-file is no b-file, and its record has no offset', async () => {
+      const { calls, result } = await getTerms(
+        { aNumber: 'A397217' },
+        bFile(synthesizedBFile('A397217', [])),
+        record(reservedRecordJson),
+      );
+      expect(result.isError).toBeUndefined();
+      expect(calls).toHaveLength(2);
+      expect(structured(result)).toMatchObject({
+        source: 'data',
+        terms: [],
+        bFileCut: false,
+        truncated: false,
+        shown: 0,
+      });
+      expect(structured(result)).not.toHaveProperty('bFileUrl');
+      expect(structured(result)).not.toHaveProperty('bFileSizeInBytes');
+      expect(structured(result)).not.toHaveProperty('firstAvailableIndex');
       expect(structured(result).notice).toBe(
         'OEIS publishes no terms for this entry. This entry has no b-file; these are the data-line terms only.',
       );

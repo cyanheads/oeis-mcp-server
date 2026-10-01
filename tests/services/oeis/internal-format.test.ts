@@ -8,11 +8,13 @@ import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { describe, expect, it } from 'vitest';
 import { parseSearchText } from '@/services/oeis/internal-format.js';
 import {
+  catalanSearchRecord,
   clampedSearchPage,
   fibonacciSearchRecord,
   htmlMaintenanceBody,
   moebiusSearchPage,
   noResultsSearchPage,
+  reservedSearchRecordText,
   resultsSearchPage,
   searchPageText,
   tooManySearchPage,
@@ -193,6 +195,46 @@ describe('parseSearchText', () => {
         ['1', '2'],
         ['3', '4'],
       ]);
+    });
+  });
+
+  describe('reserved and recycled rows', () => {
+    const pageWith = (...records: Parameters<typeof searchPageText>[0]['records'] & {}) =>
+      parseSearchText(
+        searchPageText({
+          query: 'keyword:allocated',
+          status: `Showing 1-${records.length} of ${records.length}`,
+          records,
+        }),
+      );
+
+    it('reads a reserved row with no %S or %O line as a summary without offset or firstIndex', () => {
+      expect(pageWith(reservedSearchRecordText()).rows).toEqual([
+        {
+          aNumber: 'A397217',
+          name: 'allocated for Jane Doe',
+          terms: [],
+          keywords: ['allocated'],
+          url: 'https://oeis.org/A397217',
+        },
+      ]);
+    });
+
+    it('reads a recycled row the same way', () => {
+      const recycled = reservedSearchRecordText().replace(
+        '%K A397217 allocated',
+        '%K A397217 recycled',
+      );
+      const [row] = pageWith(recycled).rows;
+      expect(row).toMatchObject({ aNumber: 'A397217', keywords: ['recycled'] });
+      expect(row).not.toHaveProperty('offset');
+    });
+
+    it('lists a reserved row beside ordinary rows instead of failing the page', () => {
+      const page = pageWith(fibonacciSearchRecord, reservedSearchRecordText(), catalanSearchRecord);
+      expect(page.rows.map((row) => row.aNumber)).toEqual(['A000045', 'A397217', 'A000108']);
+      expect(page.rows[0]).toMatchObject({ offset: '0,4', firstIndex: 0 });
+      expect(page.rows[2]).toMatchObject({ offset: '0,3', firstIndex: 0 });
     });
   });
 

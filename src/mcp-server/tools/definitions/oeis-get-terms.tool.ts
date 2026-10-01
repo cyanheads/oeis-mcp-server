@@ -11,10 +11,41 @@ import { ANumberSchema, blankAsUnset } from '@/mcp-server/shared/oeis-schemas.js
 import { bFileUrl, DEFAULT_DEADLINE_MS, getOeisService } from '@/services/oeis/oeis-service.js';
 import type { BFileTerm } from '@/services/oeis/types.js';
 
+/** Most bytes one response carries: the `format()` text plus the structured JSON. */
+const RESPONSE_BUDGET_BYTES = 100_000;
+/** Held back from the budget for everything in a response except the term lines and objects. */
+const FIXED_RESERVE_BYTES = 4_000;
+const encoder = new TextEncoder();
+
+/** One term as `format()` renders it. */
+function termLine(term: BFileTerm): string {
+  return `a(${term.n}) = ${inline(term.value)}`;
+}
+
+/**
+ * A term's share of a response: its rendered line and its JSON object, plus 3 for their separators
+ * on the wire (the line's newline, 2 bytes once JSON-escaped, and the array comma).
+ */
+function termBytes(term: BFileTerm): number {
+  return encoder.encode(termLine(term)).length + encoder.encode(JSON.stringify(term)).length + 3;
+}
+
+/** The leading terms of `window` that fit the response budget; always at least one. */
+function fitToBudget(window: BFileTerm[]): BFileTerm[] {
+  let spent = FIXED_RESERVE_BYTES;
+  let count = 0;
+  for (const term of window) {
+    spent += termBytes(term);
+    if (count > 0 && spent > RESPONSE_BUDGET_BYTES) break;
+    count++;
+  }
+  return window.slice(0, count);
+}
+
 export const oeisGetTerms = tool('oeis_get_terms', {
   title: 'Get OEIS Sequence Terms',
   description:
-    "List terms a(n) of a sequence with their indices n. Reads the entry's b-file when it has one — often thousands of terms beyond the data line — and otherwise the data line itself. Values are exact decimal strings of any size.",
+    "List terms a(n) of a sequence with their indices n. Reads the entry's b-file when it has one — often thousands of terms beyond the data line — and otherwise the data line itself. Values are exact decimal strings of any size. A slice stops at limit terms or at about 100,000 bytes, whichever comes first; nextFromIndex continues it.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     aNumber: ANumberSchema,
@@ -22,7 +53,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       'First index n to return; defaults to the first available index. Pass nextFromIndex from the previous call to continue.',
     ),
     limit: blankAsUnset(z.number().int().min(1).max(1000).default(100)).describe(
-      'Maximum number of terms to return, 1–1000 (default 100).',
+      'Maximum number of terms to return, 1–1000 (default 100). A slice of large terms stops sooner, at about 100,000 bytes; continue with nextFromIndex.',
     ),
   }),
   output: z.object({
@@ -81,7 +112,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       .string()
       .optional()
       .describe(
-        'Guidance: where the next slice starts, why no terms came back, or that the terms are data-line only or cut at 1 MiB.',
+        'Guidance: where the next slice starts and whether the byte budget ended this one, why no terms came back, or that the terms are data-line only or cut at 1 MiB.',
       ),
   },
   errors: [
@@ -134,15 +165,21 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       if (!record) {
         throw ctx.fail('sequence_not_found', `OEIS has no entry ${aNumber}.`, { aNumber });
       }
-      terms = record.terms.map((value, i) => ({ n: record.firstIndex + i, value }));
+      // A reserved or recycled A-number has no offset, so its data line has no indices.
+      const { firstIndex } = record;
+      terms =
+        firstIndex === undefined
+          ? []
+          : record.terms.map((value, i) => ({ n: firstIndex + i, value }));
     }
     const source: 'bfile' | 'data' = bFile?.status === 'ok' ? 'bfile' : 'data';
     const bFileCut = bFile?.status === 'ok' && bFile.cut;
 
     const found = fromIndex === undefined ? 0 : terms.findIndex((term) => term.n >= fromIndex);
     const begin = found === -1 ? terms.length : found;
-    const slice = terms.slice(begin, begin + limit);
-    const next = terms[begin + limit];
+    const window = terms.slice(begin, begin + limit);
+    const slice = fitToBudget(window);
+    const next = terms[begin + slice.length];
     const first = terms[0];
     const last = terms.at(-1);
     ctx.enrich({ shown: slice.length });
@@ -163,7 +200,11 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       notices.push('This entry has no b-file; these are the data-line terms only.');
     }
     if (next) {
-      notices.push(`More terms follow; call again with fromIndex ${next.n}.`);
+      notices.push(
+        slice.length < window.length
+          ? `Stopped after ${slice.length} ${slice.length === 1 ? 'term' : 'terms'} to stay within the 100,000-byte response budget; call again with fromIndex ${next.n}.`
+          : `More terms follow; call again with fromIndex ${next.n}.`,
+      );
       ctx.enrich.truncated({ shown: slice.length, cap: limit, guidance: notices.join(' ') });
     } else if (notices.length) {
       ctx.enrich.notice(notices.join(' '));
@@ -206,9 +247,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       '',
       '## Terms',
       '',
-      result.terms.length
-        ? result.terms.map((term) => `a(${term.n}) = ${inline(term.value)}`).join('\n')
-        : 'None in this slice.',
+      result.terms.length ? result.terms.map(termLine).join('\n') : 'None in this slice.',
     );
     if (result.nextFromIndex !== undefined) {
       lines.push('', `**Next slice:** call again with fromIndex ${result.nextFromIndex}.`);

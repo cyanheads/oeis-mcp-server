@@ -45,6 +45,11 @@ const RECORD_TTL_MS = 24 * 60 * 60 * 1000;
 const SEARCH_TTL_MS = 60 * 60 * 1000;
 const BFILE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const BFILE_LINE = /^\s*(-?\d+)\s+(-?\d+)\s*$/;
+/**
+ * First line of the file OEIS serves at the b-file path of an entry that has none, built from the
+ * data line: `# A181630 (b-file synthesized from sequence entry)`.
+ */
+const SYNTHESIZED_BFILE = /^#\s*A\d{6,7}\s+\(b-file synthesized from sequence entry\)/;
 const HTML_START = /^\s*<(!doctype\s+html|html[\s>])/i;
 const DEFAULT_USER_AGENT = 'oeis-mcp-server (+https://github.com/cyanheads/oeis-mcp-server)';
 
@@ -309,7 +314,8 @@ export class OeisService {
   /**
    * Reads the first 1 MiB of an entry's b-file from its canonical path. Reads are cached for 7 days.
    *
-   * @returns `{ status: 'missing' }` when OEIS answers `404` (the entry has no b-file).
+   * @returns `{ status: 'missing' }` when the entry has no b-file: OEIS answers `404`, or `200` with
+   *   a file it synthesized from the data line.
    */
   async getBFile(
     aNumber: string,
@@ -334,6 +340,8 @@ export class OeisService {
           return { status: 'missing' };
         }
         const { bytes, overflowed } = await readCapped(res, BFILE_MAX_BYTES);
+        const text = new TextDecoder().decode(bytes);
+        if (SYNTHESIZED_BFILE.test(text)) return { status: 'missing' };
         const sizeInBytes =
           res.status === 206
             ? headerInt(res.headers.get('content-range')?.split('/')[1] ?? null)
@@ -341,7 +349,7 @@ export class OeisService {
         const cut = overflowed || (sizeInBytes !== undefined && sizeInBytes > bytes.length);
         return {
           status: 'ok',
-          terms: parseBFile(new TextDecoder().decode(bytes), cut),
+          terms: parseBFile(text, cut),
           ...(sizeInBytes !== undefined && { sizeInBytes }),
           cut,
         };

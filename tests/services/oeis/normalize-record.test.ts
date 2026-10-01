@@ -12,6 +12,7 @@ import {
   minimalRecordJson,
   type RawRecord,
   recordWith,
+  reservedRecordJson,
 } from '../../fixtures/oeis-upstream.js';
 
 function normalizeError(body: RawRecord): McpError {
@@ -130,15 +131,7 @@ describe('normalizeRecord', () => {
 
     it('lists every failing field once', () => {
       const error = normalizeError({});
-      for (const field of [
-        'number',
-        'data',
-        'name',
-        'keyword',
-        'offset',
-        'references',
-        'revision',
-      ]) {
+      for (const field of ['number', 'data', 'name', 'keyword', 'references', 'revision']) {
         expect(error.message).toContain(field);
       }
     });
@@ -160,6 +153,35 @@ describe('normalizeRecord', () => {
       const error = normalizeError(recordWith({ offset }));
       expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
       expect(error.message).toContain('A000045');
+    });
+  });
+
+  describe('reserved and recycled entries', () => {
+    it.each(['allocated', 'recycled'])(
+      'normalizes a %s record with no offset, leaving offset and firstIndex absent',
+      (keyword) => {
+        const record = normalizeRecord(recordWith({ keyword }, reservedRecordJson));
+        expect(record).toMatchObject({
+          aNumber: 'A397217',
+          name: 'allocated for Jane Doe',
+          terms: [],
+          keywords: [keyword],
+          url: 'https://oeis.org/A397217',
+        });
+        expect(record).not.toHaveProperty('offset');
+        expect(record).not.toHaveProperty('firstIndex');
+      },
+    );
+
+    it('still rejects an ordinary record with no offset as non-retryable upstream_unparseable', () => {
+      const error = normalizeError(recordWith({ keyword: 'nonn,new' }, reservedRecordJson));
+      expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
+      expect(error.message).toContain('offset');
+    });
+
+    it('keeps the offset of a reserved record that carries one', () => {
+      const record = normalizeRecord(recordWith({ offset: '0,1' }, reservedRecordJson));
+      expect(record).toMatchObject({ offset: '0,1', firstIndex: 0 });
     });
   });
 

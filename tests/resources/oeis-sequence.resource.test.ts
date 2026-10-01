@@ -21,6 +21,7 @@ import {
   type RawRecord,
   recordBody,
   recordWith,
+  reservedRecordJson,
 } from '../fixtures/oeis-upstream.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { serviceOver, withBackoff } from '../fixtures/tool-service.js';
@@ -296,6 +297,22 @@ describe('oeis://sequence/{aNumber}', () => {
       ]);
       const urls = links.flatMap((link) => link.urls).join(' ');
       expect(urls).not.toMatch(/javascript:|data:|mailto:|ftp:/i);
+    });
+  });
+
+  describe('reserved entry', () => {
+    it('reads a reserved A-number whose record has no offset, without offset or firstIndex', async () => {
+      const { output } = await read('oeis://sequence/A397217', record(reservedRecordJson));
+      expect(output).toMatchObject({
+        kind: 'full',
+        aNumber: 'A397217',
+        name: 'allocated for Jane Doe',
+        terms: [],
+        keywords: ['allocated'],
+        comments: [],
+      });
+      expect(output).not.toHaveProperty('offset');
+      expect(output).not.toHaveProperty('firstIndex');
     });
   });
 

@@ -25,6 +25,7 @@ import {
   type RawRecord,
   recordBody,
   recordWith,
+  reservedRecordJson,
 } from '../fixtures/oeis-upstream.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, queryOf, serviceOver, withBackoff } from '../fixtures/tool-service.js';
@@ -416,6 +417,24 @@ describe('oeis_get_sequence', () => {
         expect(text).toContain('reserved or recycled');
       },
     );
+
+    it('returns a reserved A-number that has no offset, with the reserved notice', async () => {
+      const { result } = await fetchSequence({ aNumber: 'A397217' }, ok(reservedRecordJson));
+      expect(result.isError).toBeUndefined();
+      expect(structured(result)).toMatchObject({
+        kind: 'full',
+        aNumber: 'A397217',
+        name: 'allocated for Jane Doe',
+        terms: [],
+        keywords: ['allocated'],
+        notice: 'This A-number is reserved or recycled and has no published sequence yet.',
+      });
+      expect(structured(result)).not.toHaveProperty('offset');
+      expect(structured(result)).not.toHaveProperty('firstIndex');
+      const text = textOf(result);
+      expect(text).toContain('**Offset:** none (reserved or recycled A-number)');
+      expect(text).toContain('reserved or recycled and has no published sequence yet');
+    });
 
     it('prefers the withdrawn notice when dead comes with another lifecycle keyword', async () => {
       const { notice: text } = await notice('allocated,dead');

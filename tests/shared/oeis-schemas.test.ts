@@ -106,7 +106,7 @@ describe('normalizeANumber', () => {
     'A-45',
     'https://oeis.org/search?q=1,2,3',
     'https://example.org/A000045',
-  ])('passes %j through unchanged so the pattern rejects it', (input) => {
+  ])('passes %j through unchanged so validation rejects it', (input) => {
     expect(normalizeANumber(input)).toBe(input);
   });
 
@@ -141,6 +141,30 @@ describe('ANumberSchema', () => {
     expect(ANumberSchema.description).toContain('A000045');
     expect(ANumberSchema.description).toContain('M1459');
   });
+
+  it('advertises a plain string, so the short forms its description accepts are valid', () => {
+    const advertised = z.toJSONSchema(ANumberSchema, { io: 'input', unrepresentable: 'any' });
+    expect(advertised).toMatchObject({ type: 'string' });
+    expect(advertised).not.toHaveProperty('pattern');
+  });
+
+  const messagesFor = (input: string) =>
+    ANumberSchema.safeParse(input).error?.issues.map((issue) => issue.message);
+
+  it.each(['M1459', 'N0577', ' m1459 ', 'N1'])(
+    'routes the legacy book number %j to oeis_search_sequences without echoing it',
+    (input) => {
+      expect(messagesFor(input)).toEqual([
+        'a legacy M/N book number is not an A-number; search it as a word with oeis_search_sequences to find the entry.',
+      ]);
+    },
+  );
+
+  it.each(['abc', 'A12345678', '', 'M12345'])('names the accepted forms for %j', (input) => {
+    expect(messagesFor(input)).toEqual([
+      'expected an OEIS A-number such as A000045 (A45, 45, and an oeis.org sequence URL are also accepted).',
+    ]);
+  });
 });
 
 describe('pageStartSchema', () => {
@@ -174,8 +198,19 @@ describe('SequenceSummarySchema', () => {
     expect(SequenceSummarySchema.parse(row)).toEqual(row);
   });
 
-  it.each(Object.keys(row))('requires %s', (field) => {
-    expect(SequenceSummarySchema.safeParse({ ...row, [field]: undefined }).success).toBe(false);
+  it.each(Object.keys(row).filter((key) => key !== 'offset' && key !== 'firstIndex'))(
+    'requires %s',
+    (field) => {
+      expect(SequenceSummarySchema.safeParse({ ...row, [field]: undefined }).success).toBe(false);
+    },
+  );
+
+  it('accepts a reserved row without offset and firstIndex', () => {
+    const { offset: _offset, firstIndex: _firstIndex, ...reserved } = row;
+    expect(SequenceSummarySchema.parse({ ...reserved, keywords: ['allocated'] })).toEqual({
+      ...reserved,
+      keywords: ['allocated'],
+    });
   });
 
   it('keeps terms as strings: a numeric term is rejected', () => {
