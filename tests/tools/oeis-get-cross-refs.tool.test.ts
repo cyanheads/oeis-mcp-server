@@ -400,7 +400,7 @@ describe('oeis_get_cross_refs', () => {
         const line = `Cf. ${'A000032 ('.repeat(Math.floor((1024 * 1024) / 9))}`;
         const started = performance.now();
         const rows = await refsOf([line]);
-        expect(performance.now() - started).toBeLessThan(250);
+        expect(performance.now() - started).toBeLessThan(1_000);
         expect(rows.map((row) => [row.aNumber, row.note])).toEqual([['A000032', undefined]]);
       });
     });

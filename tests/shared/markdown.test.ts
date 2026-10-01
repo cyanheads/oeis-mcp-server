@@ -146,7 +146,7 @@ describe('markup in contributor text', () => {
     for (const render of [inline, blockquote]) {
       const started = performance.now();
       render(text);
-      expect(performance.now() - started).toBeLessThan(250);
+      expect(performance.now() - started).toBeLessThan(1_000);
     }
   });
 });

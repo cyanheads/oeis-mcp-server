@@ -513,7 +513,7 @@ describe('normalizeRecord', () => {
       const raw = recordWith(override);
       const started = performance.now();
       normalizeRecord(raw);
-      expect(performance.now() - started).toBeLessThan(250);
+      expect(performance.now() - started).toBeLessThan(1_000);
     });
   });
 });

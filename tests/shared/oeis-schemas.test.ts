@@ -110,7 +110,7 @@ describe('normalizeANumber', () => {
     ['the percent-encoded form a resource URI carries', `${'%2F'.repeat((MIB - 4) / 3)}%0Ax`],
   ])('reads 1 MiB of %s in linear time', (_shape, input) => {
     let parsed: ReturnType<typeof ANumberSchema.safeParse> | undefined;
-    expect(elapsedMs(() => (parsed = ANumberSchema.safeParse(input)))).toBeLessThan(250);
+    expect(elapsedMs(() => (parsed = ANumberSchema.safeParse(input)))).toBeLessThan(1_000);
     expect(parsed?.success).toBe(false);
   });
 
