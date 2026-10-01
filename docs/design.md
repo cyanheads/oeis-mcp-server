@@ -442,7 +442,7 @@ Decision: build **A** and ship it for local (stdio) use; adopt **D** before any 
 - `oeis_get_terms` reads at most the first 1 MiB of a b-file.
 - `oeis_get_cross_refs` outgoing shares the `start` ≤ 100 bound, so an entry naming more than 110 distinct A-numbers lists only the first 110.
 - Throughput is one upstream request per 10 s per server process; concurrent uncached calls queue and, past the wait budget, fail with `retryAfter`.
-- One pacer serves every caller. The server has no caller identity to queue by (a stateless deployment without auth gives it none), so one caller keeping a few uncached calls queued can take the whole budget and leave every other caller shed with `retryAfter`. A hosted deployment needs a per-client rate limit in front of the server, on top of the local index (option D) the design already requires before hosting.
+- One pacer serves every caller. The server has no caller identity to queue by (a stateless deployment without auth gives it none), so one caller keeping a few uncached calls queued can take the whole budget and leave every other caller shed with `retryAfter`.
 - The pace holds per process, so run one replica: each process paces itself, and N replicas behind one IP send oeis.org N times the published crawl rate.
 - The 50 s call deadline keeps 15 s for the request itself, so `OEIS_QUEUE_MAX_WAIT_MS` takes effect only up to 35,000 ms; a call whose wait would run longer sheds at once.
 - Record freshness: cached up to 24 h, then revalidated.
