@@ -4,6 +4,7 @@
     "args": ["-y", "@cyanheads/oeis-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
-    }
+    },
+    "env_vars": ["OEIS_QUEUE_MAX_WAIT_MS"]
   }
 }

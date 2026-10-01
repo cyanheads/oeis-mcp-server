@@ -6,12 +6,12 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `oeis_identify_sequence` | Identify candidate sequences from a run of consecutive integer terms, ranked by OEIS relevance, each with the index where the supplied run begins. | `terms`, `matchSigns`, `start` | readOnly, openWorld |
-| `oeis_search_sequences` | Search the OEIS with its own query syntax: words, phrases, term lists, and prefixes such as `keyword:`, `author:`, `name:`, `formula:`. | `query`, `sort`, `start` | readOnly, openWorld |
+| `oeis_identify_sequence` | Identify candidate sequences from a run of consecutive integer terms, ranked by OEIS relevance, each with the index where the supplied run begins. | `terms`, `matchSigns`, `start` | readOnly, openWorld, idempotent |
+| `oeis_search_sequences` | Search the OEIS with its own query syntax: words, phrases, term lists, and prefixes such as `keyword:`, `author:`, `name:`, `formula:`. | `query`, `sort`, `start` | readOnly, openWorld, idempotent |
 | `oeis_get_sequence` | Fetch one entry by A-number: name, terms, offset, keywords, and the comment/formula/example/program/reference/link/cross-reference sections, or a section outline when the entry is large. | `aNumber`, `sections` | readOnly, openWorld, idempotent |
 | `oeis_get_terms` | List terms a(n) with their indices, from the entry's b-file when one exists (far more terms than the data line), else from the data line. | `aNumber`, `fromIndex`, `limit` | readOnly, openWorld, idempotent |
-| `oeis_get_cross_refs` | List related sequences: the A-numbers an entry's cross-reference lines name (outgoing), or the entries that mention it (incoming), each resolved to a name and first terms. | `aNumber`, `direction`, `start` | readOnly, openWorld |
-| `oeis_list_reference` | Decode OEIS vocabulary: keyword flags, search syntax and sort orders, identifier and offset conventions. Static, no upstream call. | `topic` | readOnly, `openWorldHint: false` |
+| `oeis_get_cross_refs` | List related sequences: the A-numbers an entry's cross-reference lines name (outgoing), or the entries that mention it (incoming), each resolved to a name and first terms. | `aNumber`, `direction`, `start` | readOnly, openWorld, idempotent |
+| `oeis_list_reference` | Decode OEIS vocabulary: keyword flags, search syntax and sort orders, identifier and offset conventions. Static, no upstream call. | `topic` | readOnly, idempotent, `openWorldHint: false` |
 
 ### Resources
 
@@ -68,10 +68,10 @@ Single upstream (oeis.org), keyless, read-only.
 
 ```ts
 z.preprocess(normalizeANumber, z.string().regex(/^A\d{6,7}$/))
-  .describe('OEIS A-number, e.g. "A000045". Also accepts "a000045", "A45", "45", and an oeis.org sequence URL; all normalize to the zero-padded form. Legacy M/N book numbers (e.g. "M1459") are not A-numbers: find them with oeis_search_sequences.')
+  .describe('OEIS A-number, e.g. "A000045"; oeis_identify_sequence and oeis_search_sequences return them. Also accepts "a000045", "A45", "45", and an oeis.org sequence URL; all normalize to the zero-padded form. Legacy M/N book numbers (e.g. "M1459") are not A-numbers: find them with oeis_search_sequences.')
 ```
 
-`normalizeANumber`: trim; strip a leading `http://` or `https://`, then `www.oeis.org/` or `oeis.org/`, then everything from the first `/`, `?`, or `#` after the A-number (so `oeis.org/A000045/b000045.txt` → `A000045`); uppercase a leading `a`; if the remainder is `A?\d{1,7}`, parse the digits as an integer and left-pad to 6 (`A0000045` → `A000045`, `A45` → `A000045`). Everything else passes through unchanged and fails the regex. Legacy `M####`/`N####` numbers are not A-numbers and fail the pattern; the framework's `invalid_arguments` hint names the expected shape, and `oeis_list_reference` topic `identifiers` says to search them as words with `oeis_search_sequences`. The canonical form matters upstream: both `/A45?fmt=json` and `/A0000045?fmt=json` answer `301` to `/A000045` with the query dropped, and the fetch boundary never follows a redirect.
+`normalizeANumber`: trim; decode `%XX` escapes (the resource's `{aNumber}` template variable reaches the schema undecoded, so a URL given there arrives as `https%3A%2F%2Foeis.org%2FA000108`); strip a leading `http://` or `https://`, then `www.oeis.org/` or `oeis.org/`, then everything from the first `/`, `?`, or `#` after the A-number (so `oeis.org/A000045/b000045.txt` → `A000045`); uppercase a leading `a`; if the remainder is `A?\d{1,7}`, parse the digits as an integer and left-pad to 6 (`A0000045` → `A000045`, `A45` → `A000045`). Everything else passes through unchanged and fails the regex. Legacy `M####`/`N####` numbers are not A-numbers and fail the pattern; the framework's `invalid_arguments` hint names the expected shape, and `oeis_list_reference` topic `identifiers` says to search them as words with `oeis_search_sequences`. The canonical form matters upstream: both `/A45?fmt=json` and `/A0000045?fmt=json` answer `301` to `/A000045` with the query dropped, and the fetch boundary never follows a redirect.
 
 **Blank optional inputs** — form-based clients send `""` for every optional field they display. Every optional or defaulted input (`matchSigns`, `start`, `sort`, `fromIndex`, `limit`, `direction`) is wrapped once in a shared helper, so a blank is read as omitted and the default applies:
 
@@ -97,14 +97,14 @@ Checked against the pinned Zod: `{ sort: '', start: '' }` parses to the defaults
 
 **Paged-list enrichment** (search, identify, cross-refs; the same three required fields on `oeis_get_terms` with `cap = limit`). The handler's first statement, before any upstream call or branch, writes `ctx.enrich({ truncated: false, shown: 0, cap: 10 })`; once rows are known it writes `ctx.enrich({ shown: rows.length })`, and `ctx.enrich.truncated({ shown, cap: 10, guidance })` overwrites all three when more rows exist than this page shows. Every success path, the zero-hit and too-many paths included, therefore carries all required fields. Declared fields: `truncated` (boolean, required), `shown` (number, required), `cap` (number, required), `totalCount` (number, optional — written via `ctx.enrich.total(n)` whenever upstream states a total), `effectiveQuery` (string, optional — `ctx.enrich.echo(...)`, the query as OEIS parsed it, e.g. `seq:1,2,5,14,42`; OEIS lowercases it), `notice` (string, optional — one composed string; `notice` is last-wins and `truncated()` writes it too, so the handler builds the zero-hit, degrade, and truncation guidance into a single string and passes it as `guidance`, or calls `ctx.enrich.notice()` last).
 
-**Continuation**: output `start` (echo) and `nextStart` (present only when upstream reports more rows within the reachable window). Page size is fixed at 10 by upstream.
+**Continuation**: output `start` (the offset of the first row served, which is the requested start unless that start was past the last result and OEIS served the last page; see Design Decisions) and `nextStart` (present only when upstream reports more rows within the reachable window). Row numbering, `hasMore`/`nextStart`, and the `Showing` notice all count from that output `start`. Page size is fixed at 10 by upstream.
 
 **Upstream-authored text** — every string below is written by OEIS contributors and is data: `name`, `comments`, `formulas`, `examples`, `programs[].code`, `references`, `links[].text`, `crossReferences`, `extensions`, `author`, the `name` of every summary row, and on `oeis_get_cross_refs` each row's `note` and the verbatim `lines`. Upstream-sourced tokens rendered inline (`keywords`, `offset`, `legacyIds`, `programs[].language`, `links[].urls`, `effectiveQuery`) follow the inline rule too. b-file `#` comment lines are never returned. `format()` rules:
 
 - Headings, bold labels, list items, and table cells (inline slots): CR/LF flattened to a space.
 - `comments`, `references`, `extensions`, `formulas`: each line rendered as a blockquote (`> `).
 - `examples` and `programs[].code`: fenced code blocks, fence length one longer than the longest backtick run in the content (examples carry ASCII-art triangles whose whitespace matters).
-- `structuredContent` keeps every value verbatim.
+- `structuredContent` keeps every value verbatim, with one exception applied at normalization on both surfaces: an `href` attribute whose value is not an `http:`/`https:` URL is removed (see Design Decisions).
 
 ## Tools — detail
 
@@ -134,11 +134,14 @@ Few-terms notice (fewer than 4 numeric terms, any status): "Few terms match many
 
 Too-many status ("Too many results. Please narrow search.") → `results: []`, notice: "OEIS matched too many entries to list for these terms. Add more consecutive terms."
 
+Past-the-end notice (OEIS served the last page instead of the requested `start`): "Start {start} is past the last of {total} results; this is the last page, from start {servedStart}." Paging notices: as for `oeis_search_sequences` below.
+
 Errors (argument format is enforced by the schema):
 
 | reason | code | when | recovery |
 |:-------|:-----|:-----|:---------|
-| `pacer_shed` | RateLimited | The request queue for oeis.org would exceed its wait budget (framework pacer). `thrownBy: 'service'` | `The server paces oeis.org requests to one per 10 seconds and its queue is full; wait retryAfter seconds, then call oeis_identify_sequence again.` |
+| `pacer_shed` | RateLimited | The request queue for oeis.org would exceed its wait budget (framework pacer). `thrownBy: 'service'` | `oeis.org requests are paced to one every 10 seconds and the queue is backed up; wait the retryAfter seconds in the error data (30 seconds if none is shown), then call oeis_identify_sequence again.` |
+| `upstream_rate_limited` | RateLimited | oeis.org answered HTTP 429 and retries within the call did not clear it (see the 429 resilience row). `thrownBy: 'service'` | `oeis.org answered 429 Too Many Requests; wait as long as the retryAfter in the error data says (seconds, or an HTTP date), or 30 seconds if none is shown, then call oeis_identify_sequence again.` |
 
 ### `oeis_search_sequences`
 
@@ -152,18 +155,20 @@ Description: "Search the OEIS using its query syntax: plain words, "quoted phras
 
 Output: `results: SequenceSummary[]`, `start`, `nextStart?`, `sort` (echo of the applied order).
 
-Zero-hit notice ("No results."), composed:
-- a `word:` token whose prefix is not in the verified prefix list → "\"{prefix}:\" is not an OEIS prefix, so OEIS searched it as plain words. oeis_list_reference topic search_syntax lists the valid prefixes."
+Zero-hit notice ("No results.", which OEIS answers at any `start` only for a query that matches nothing), composed:
+- a `word:` token (outside quoted phrases; `-` and `|` separate tokens) whose prefix is not in the verified prefix list → "\"{prefix}:\" is not an OEIS prefix, so OEIS searched it as plain words. oeis_list_reference topic search_syntax lists the valid prefixes."
 - query is only numbers → "For a run of terms, oeis_identify_sequence reports where the run starts and can ignore signs."
-- default → "Loosen the query: drop a prefix filter or a quoted phrase, or use | between alternatives."
+- default (none of the above) → "Loosen the query: drop a prefix filter or a quoted phrase, or use | between alternatives."
 
 Too-many status → `results: []`, notice: "OEIS matched too many entries to list. Add a word, a quoted phrase, or a prefix such as keyword:nice or author:<name>."
 
-Errors: `pacer_shed` as above (recovery names `oeis_search_sequences`).
+A `start` past the last result is served the last page → output `start` is that page's offset, and the notice opens "Start {start} is past the last of {total} results; this is the last page, from start {servedStart}." More rows past the page → `truncated` with "Showing {a}-{b} of {total}; call again with start {nextStart} for the next page.", or, once `start` is 100, "OEIS lists only the first 110 of {total} matches without an account; add a word, a quoted phrase, or a prefix to narrow the query."
+
+Errors: `pacer_shed` and `upstream_rate_limited` as above (recoveries name `oeis_search_sequences`).
 
 ### `oeis_get_sequence`
 
-Description: "Fetch one OEIS entry by A-number. Returns the name, data-line terms, offset, keywords, author, dates, and the sections: comments, formulas (recurrences and generating functions), examples, programs (Maple, Mathematica, PARI, Python, …), references, links, cross-references, and extensions. When the whole entry exceeds about 24 KB, the core fields come back with a section outline instead; call again with sections to pick what to read."
+Description: "Fetch one OEIS entry by A-number. Returns the name, data-line terms, offset, keywords, author, dates, and the sections: comments, formulas (recurrences and generating functions), examples, programs (Maple, Mathematica, PARI, Python, …), references, links, cross-references, and extensions. When the sections together exceed 24,000 characters of serialized JSON, the core fields come back with a section outline instead; call again with sections to pick what to read."
 
 | Param | Type | Maps to | Notes |
 |:------|:-----|:--------|:------|
@@ -173,10 +178,10 @@ Description: "Fetch one OEIS entry by A-number. Returns the name, data-line term
 Output (flat object, `kind` discriminator, arms rendered on field presence):
 
 - Core (always): `kind` (`full` \| `outline`), `aNumber`, `name`, `terms` (string[]), `offset`, `firstIndex`, `keywords` (string[]), `author?`, `legacyIds?` (string[], from `id`, e.g. `["M0692","N0256"]`), `referenceCount` (number of OEIS entries that mention this A-number, the entry itself included), `revision` (number), `created?` / `modified?` (ISO 8601 with offset as upstream sends; from `created` and `time`), `url`, `bFileUrl?` (absolute URL when a `link` line points at `/A######/b######.txt`).
-- Sections (full arm or selected): `comments`, `formulas`, `examples`, `references`, `crossReferences`, `extensions` (string[] each, one element per upstream line); `programs` (`{ language, code }[]`); `links` (`{ text, urls: string[] }[]`).
-- Outline arm: `sections: { name, bytes }[]` (largest first, `OUTLINE_VARIANT.shape.sections` described in place) plus `outlineNotice` (the helper's `notice`, renamed because `notice` is the enrichment key), built with `outlineOnOverflow(heavySections, { budget: 24_000, extract })` where `extract` sizes only the eight section arrays; the core fields are merged into the result. `format()` renders the core fields, then each present section, then the outline via `formatOutline`, each on field presence.
+- Sections (full arm or selected): `comments`, `formulas`, `examples`, `references`, `crossReferences`, `extensions` (string[] each, one element per upstream line); `programs` (`{ language?, code }[]`; `language` is absent on a `program` block whose first line carries no `(Lang)` tag); `links` (`{ text, urls: string[] }[]`).
+- Outline arm: `sections: { name, bytes }[]` (largest first, `OUTLINE_VARIANT.shape.sections` described in place) plus `outlineNotice` (the helper's `notice`, renamed because `notice` is the enrichment key), built with `outlineOnOverflow(heavySections, { budget: 24_000 })` over the eight section arrays only; the core fields are merged into the result. The budget and every `bytes` value are serialized-JSON characters (UTF-16 code units), not UTF-8 bytes; see Design Decisions. `format()` renders the core fields, then each present section, then the outline via `formatOutline`, each on field presence.
 
-Normalization (service): absent upstream arrays become `[]` (an entry with no `%C` lines has zero comments; this is the upstream's own meaning, and it lets `selectSections` accept every enum value). `programs`: `maple` lines → one block `language: "Maple"`; `mathematica` → one block `"Mathematica"`; `program` lines split into blocks at each line matching `^\(([A-Z][A-Za-z0-9+#/._ -]{0,24})\)(\s|$)` (verified tags: Axiom, GAP, Haskell, Julia, Magma, Maxima, PARI, Python, SageMath, Scala; a continuation line such as `(0 to 49).map(...)` starts with a digit and stays in its block). `links`: each line → `urls` from every `<a href="…">` (relative hrefs made absolute on `https://oeis.org`), `text` = the line with tags stripped and `&amp; &lt; &gt; &quot; &#N;` decoded.
+Normalization (service): absent upstream arrays become `[]` (an entry with no `%C` lines has zero comments; this is the upstream's own meaning, and it lets `selectSections` accept every enum value). `programs`: `maple` lines → one block `language: "Maple"`; `mathematica` → one block `"Mathematica"`; `program` lines split into blocks at each line matching `^\(([A-Z][A-Za-z0-9+#/._ -]{0,24})\)(\s|$)` (verified tags: Axiom, GAP, Haskell, Julia, Magma, Maxima, PARI, Python, SageMath, Scala; a continuation line such as `(0 to 49).map(...)` starts with a digit and stays in its block). `links`: each line → `urls` from every `<a href="…">` (relative hrefs made absolute on `https://oeis.org`; only `http:` and `https:` URLs are kept), `text` = the line with tags stripped and `&amp; &lt; &gt; &quot; &#N;` decoded.
 
 Enrichment: `notice` (optional) — when `keywords` includes `dead`: "This entry is withdrawn (keyword dead); its name gives the reason and usually the replacement A-number — pass that to oeis_get_sequence." When it includes `allocated` or `recycled`: "This A-number is reserved or recycled and has no published sequence yet."
 
@@ -184,8 +189,9 @@ Errors:
 
 | reason | code | when | recovery |
 |:-------|:-----|:-----|:---------|
-| `sequence_not_found` | NotFound | Upstream `404` on `/A######?fmt=json`. `thrownBy: 'service'` | `No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.` |
-| `pacer_shed` | RateLimited | Queue budget exceeded. `thrownBy: 'service'` | `The server paces oeis.org requests to one per 10 seconds and its queue is full; wait retryAfter seconds, then call oeis_get_sequence again.` |
+| `sequence_not_found` | NotFound | `No OEIS entry exists for the requested A-number.` Upstream `404` on `/A######?fmt=json`; the handler throws it via `ctx.fail` when `getRecord` returns `undefined`. | `No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.` |
+| `pacer_shed` | RateLimited | Queue budget exceeded. `thrownBy: 'service'` | `oeis.org requests are paced to one every 10 seconds and the queue is backed up; wait the retryAfter seconds in the error data (30 seconds if none is shown), then call oeis_get_sequence again.` |
+| `upstream_rate_limited` | RateLimited | Upstream 429 not cleared by the call's retries. `thrownBy: 'service'` | `oeis.org answered 429 Too Many Requests; wait as long as the retryAfter in the error data says (seconds, or an HTTP date), or 30 seconds if none is shown, then call oeis_get_sequence again.` |
 
 An unknown `sections` value is rejected by the enum at the schema.
 
@@ -201,13 +207,13 @@ Description: "List terms a(n) of a sequence with their indices n. Reads the entr
 
 Flow: b-files always live at the canonical path `/A######/b######.txt`. When the record is already cached, its `bFileUrl` decides whether to request the b-file; otherwise the b-file is requested directly and the record is fetched only on a `404`, for the data-line fallback. An entry with a b-file thus costs one paced request instead of two. The b-file request is `GET /A######/b######.txt` with `Range: bytes=0-1048575` (1 MiB) through the plain-fetch boundary. A `206` is read whole; a `200` (range ignored) is read from the body stream up to 1 MiB and the stream is then cancelled, so the cap holds either way. Parse lines `^\s*(-?\d+)\s+(-?\d+)\s*$` (tabs and a trailing `\r` match), skipping blank lines, `#` comments, and any other non-matching line; drop a trailing partial line when the read was cut. If no b-file link, or the b-file answers 404, use the data-line terms with indices from `firstIndex`.
 
-Output: `aNumber`, `source` (`bfile` \| `data`), `terms: { n: number, value: string }[]`, `firstAvailableIndex`, `lastAvailableIndex` (within what was read), `nextFromIndex?` (the n to pass as `fromIndex` for the next slice; present only when more terms were read past this slice), `bFileUrl?`, `bFileSizeInBytes?` (from the `Content-Range` total, or `Content-Length` on a `200`), `bFileCut` (boolean — true when the file exceeds the 1 MiB read), `url`.
+Output: `aNumber`, `source` (`bfile` \| `data`), `terms: { n: number, value: string }[]`, `firstAvailableIndex?`, `lastAvailableIndex?` (within what was read; both absent only when OEIS publishes no terms, e.g. a reserved A-number with an empty data line), `nextFromIndex?` (the n to pass as `fromIndex` for the next slice; present only when more terms were read past this slice), `bFileUrl?`, `bFileSizeInBytes?` (from the `Content-Range` total, or `Content-Length` on a `200`), `bFileCut` (boolean — true when the file exceeds the 1 MiB read), `url`.
 
-Enrichment: `truncated`/`shown`/`cap` written first thing (`cap = limit`), overwritten when more terms exist past the slice (guidance names `nextFromIndex`); `notice` when `fromIndex` is past `lastAvailableIndex` ("No terms at n ≥ {fromIndex} in what OEIS publishes for this entry; the last available index is {k}."), when `bFileCut` ("Only the first 1 MiB of the b-file was read; terms past n = {k} are at {bFileUrl}."), and when `source` is `data` ("This entry has no b-file; these are the data-line terms only.").
+Enrichment: `truncated`/`shown`/`cap` written first thing (`cap = limit`), overwritten when more terms exist past the slice (guidance names `nextFromIndex`); `notice` when no terms were read ("OEIS publishes no terms for this entry."), when `fromIndex` is past `lastAvailableIndex` ("No terms at n ≥ {fromIndex} in what OEIS publishes for this entry; the last available index is {k}."), when `bFileCut` ("Only the first 1 MiB of the b-file was read; terms past n = {k} are at {bFileUrl}."), and when `source` is `data` ("This entry has no b-file; these are the data-line terms only.").
 
 Failure policy: a record failure fails the call (`sequence_not_found` when both the b-file and the record answer `404`). A b-file `404` or a cached record with no b-file link is the normal `source: data` path. Any other b-file failure (`pacer_shed`, `ServiceUnavailable`, `Timeout` after retries) fails the call with that classified error rather than silently falling back to the data line: the data line is already served by `oeis_get_sequence`, and a retry costs one paced request.
 
-Errors: `sequence_not_found`, `pacer_shed` (as for `oeis_get_sequence`, recovery naming `oeis_get_terms`).
+Errors: `sequence_not_found`, `pacer_shed`, `upstream_rate_limited` (as for `oeis_get_sequence`, recovery naming `oeis_get_terms`).
 
 ### `oeis_get_cross_refs`
 
@@ -217,13 +223,19 @@ Description: "List sequences related to an OEIS entry. direction outgoing return
 |:------|:-----|:--------|:------|
 | `aNumber` | A-number schema | | |
 | `direction` | enum `outgoing` \| `incoming`, default `outgoing` | | |
-| `start` | integer 0–100, default 0, `.multipleOf(10)` | outgoing: local slice; incoming: upstream `start` | Outgoing: past the last related A-number returns an empty page with a notice. |
+| `start` | integer 0–100, default 0, `.multipleOf(10)` | outgoing: local slice; incoming: upstream `start` | Outgoing: past the last related A-number returns an empty page with a notice. Incoming: past the last entry, OEIS serves the last page, and output `start` is its offset. |
 
-Outgoing flow: record (cached, allowed path) → scan `crossReferences` lines for `A\d{6,7}`, dedupe in order of first appearance, drop the entry itself → slice `[start, start+10)` → one `/search?q=id:A…|id:A…&fmt=text` call for the slice's names and terms (upstream returns relevance order; the service re-orders to the slice order). Incoming flow: `/search?q=A######%20-id:A######&fmt=text&start=…`.
+Outgoing flow: record (cached, allowed path) → scan `crossReferences` lines for `\bA\d{6,7}(?!\d)` (see Design Decisions), dedupe in order of first appearance, drop the entry itself → slice `[start, start+10)` → one `/search?q=id:A…|id:A…&fmt=text` call for the slice's names and terms (upstream returns relevance order; the service re-orders to the slice order). Incoming flow: `/search?q=A######%20-id:A######&fmt=text&start=…`.
 
-Output: `aNumber`, `direction`, `related: (SequenceSummary-fields-optional & { aNumber, resolved: boolean, note?: string, lineIndex?: number })[]`, `lines?: string[]` (outgoing: the cross-reference lines verbatim, which `lineIndex` points into), `start`, `nextStart?`. `note` = the parenthetical immediately after the A-number (`A001622 (phi)` → `phi`). `resolved: false` when the batch returned no record for that A-number (name/terms then absent, not invented).
+Output: `aNumber`, `direction`, `related: (SequenceSummary-fields-optional & { aNumber, url, resolved: boolean, note?: string, lineIndex?: number })[]`, `lines?: string[]` (outgoing: the cross-reference lines verbatim, which `lineIndex` points into), `start`, `nextStart?`. `note` = the parenthetical immediately after the A-number (`A001622 (phi)` → `phi`; nested parentheses balanced), taken from the first mention that carries one; `lineIndex` = the first line naming it. `resolved: false` when the batch returned no record for that A-number (name/terms then absent, not invented). `url` is present on every row: it is the canonical `https://oeis.org/A######` address built from the A-number, not upstream data.
 
-Enrichment: paged-list block; `totalCount` = distinct related A-numbers (outgoing) or upstream "of N" (incoming). Notice when outgoing is empty: "This entry names no other A-numbers in its cross-reference lines; try direction incoming." When incoming is empty: "No other OEIS entry mentions this A-number."
+Enrichment: paged-list block; `totalCount` = distinct related A-numbers (outgoing) or upstream "of N" (incoming); `effectiveQuery` on incoming only (the outgoing batch query is server-built). Notices, composed into one string:
+- outgoing, no A-numbers: "This entry names no other A-numbers in its cross-reference lines; try direction incoming."
+- outgoing, `start` past the last: "This entry names {total} other A-numbers; start {start} is past the last of them. Call again with start {lastPageStart}."
+- incoming, `No results.` (at any `start`): "No other OEIS entry mentions this A-number."
+- incoming, too-many status: "OEIS reports too many entries mentioning {aNumber} to list; narrow with oeis_search_sequences, e.g. \"{aNumber} keyword:core\"."
+- incoming, `start` past the last entry (OEIS served the last page): "Start {start} is past the last of {total} entries; this is the last page, from start {servedStart}."
+- more rows past the page: "Showing {a}-{b} of {total}; call again with start {nextStart} for the next page.", or at `start` 100: outgoing "Only the first 110 of {total} related A-numbers can be paged here; lines names the rest.", incoming "OEIS lists only the first 110 of {total} entries that mention {aNumber} without an account; narrow with oeis_search_sequences, e.g. \"{aNumber} keyword:core\"."
 
 Partial success (outgoing only; incoming is one upstream call and either succeeds or throws):
 
@@ -236,8 +248,9 @@ Errors:
 
 | reason | code | when | recovery |
 |:-------|:-----|:-----|:---------|
-| `sequence_not_found` | NotFound | Upstream `404` on the outgoing record fetch. `thrownBy: 'service'` | `No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.` |
-| `pacer_shed` | RateLimited | Queue budget exceeded on the record fetch or the incoming search. `thrownBy: 'service'` | `The server paces oeis.org requests to one per 10 seconds and its queue is full; wait retryAfter seconds, then call oeis_get_cross_refs again.` |
+| `sequence_not_found` | NotFound | `No OEIS entry exists for the requested A-number. Raised for direction outgoing only; direction incoming reports that no entry mentions it.` Upstream `404` on the outgoing record fetch; the handler throws it via `ctx.fail` when `getRecord` returns `undefined`. | `No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.` |
+| `pacer_shed` | RateLimited | Queue budget exceeded on the record fetch or the incoming search. `thrownBy: 'service'` | `oeis.org requests are paced to one every 10 seconds and the queue is backed up; wait the retryAfter seconds in the error data (30 seconds if none is shown), then call oeis_get_cross_refs again.` |
+| `upstream_rate_limited` | RateLimited | Upstream 429 on the record fetch or the incoming search, not cleared by the call's retries. `thrownBy: 'service'` | `oeis.org answered 429 Too Many Requests; wait as long as the retryAfter in the error data says (seconds, or an HTTP date), or 30 seconds if none is shown, then call oeis_get_cross_refs again.` |
 
 ### `oeis_list_reference`
 
@@ -257,7 +270,7 @@ No errors (enum-validated, offline).
 
 ## Resources — detail
 
-`oeis://sequence/{aNumber}` — params: `aNumber` (same schema). Returns the full normalized record (no outline; a human selected it). `cacheHint: { ttlMs: 3_600_000, cacheScope: 'public' }`. Covered by `oeis_get_sequence`. Shares the service, cache, and pacer. No `list()`. Declares the same `sequence_not_found` entry as `oeis_get_sequence`; failures reach the client through the JSON-RPC error envelope.
+`oeis://sequence/{aNumber}` — `name: 'oeis_sequence'`, `title: 'OEIS Sequence'`, `mimeType: 'application/json'`. params: `aNumber` (same schema, so `oeis://sequence/A108` reads A000108). Returns the full normalized record (no outline; a human selected it) — the `kind: 'full'` shape `oeis_get_sequence` builds, links already filtered to `http:`/`https:` URLs by the service. `cacheHint: { ttlMs: 3_600_000, cacheScope: 'public' }`. Covered by `oeis_get_sequence`. Shares the service, cache, and pacer. No `list()`. Declares the same `sequence_not_found`, `pacer_shed`, and `upstream_rate_limited` entries as `oeis_get_sequence`, the two RateLimited recoveries ending "then read this resource again."; failures reach the client through the JSON-RPC error envelope.
 
 ## Services
 
@@ -266,7 +279,12 @@ No errors (enum-validated, offline).
 | `OeisService` (`src/services/oeis/oeis-service.ts`) | oeis.org: `/A######?fmt=json`, `/search?fmt=text`, `/A######/b######.txt` | every tool except `oeis_list_reference`; the resource |
 | `internal-format.ts` (same dir) | Parser for `fmt=text` search responses: header, status line, `%S %T %U %N %K %O` record lines | `OeisService.search` |
 
-Methods: `getRecord(aNumber, ctx)` → normalized record or `undefined` on 404; `search({ q, sort, start }, ctx)` → `{ effectiveQuery, status: 'results' | 'none' | 'too_many', total?, rows: SequenceSummary[] }`; `getBFile(aNumber, url, ctx)` → `{ status: 'ok' | 'missing', lines, sizeInBytes?, cut }`.
+Methods (each upstream method takes an optional third argument `{ deadlineMs? }`, the call's total budget for attempts, backoffs, and queue wait, default 50 s; a tool making a second upstream call passes the remaining budget):
+
+- `getRecord(aNumber, ctx, opts)` → normalized record, or `undefined` on 404.
+- `getCachedRecord(aNumber)` → the cached record, fresh or stale, or `undefined`; never makes a request.
+- `search({ q, sort, start }, ctx, opts)` → `{ effectiveQuery, status: 'results' | 'none' | 'too_many', start?, total?, rows: SequenceSummary[] }`; `start` (on `results` pages) is the offset OEIS served, from the `Showing` line.
+- `getBFile(aNumber, ctx, opts)` → `{ status: 'ok', terms: { n, value }[], sizeInBytes?, cut } | { status: 'missing' }`. The URL is derived from the A-number (`/A######/b######.txt`), so no `url` parameter.
 
 Resilience:
 
@@ -276,9 +294,9 @@ Resilience:
 | Retry boundary | `withRetry(({ signal, remainingMs }) => pacer.run((s) => fetchAndParse(s, Math.min(15_000, remainingMs)), { signal, maxWaitMs: Math.min(OEIS_QUEUE_MAX_WAIT_MS, remainingMs - 15_000) }), { maxRetries: 2, baseDelayMs: 2_000, maxDelayMs: 30_000, deadlineMs, signal: ctx.signal, context: ctx })` around fetch + parse. Passing the attempt signal charges queue time to the same deadline, and capping `maxWaitMs` at what the deadline can still absorb makes a hopeless wait shed at enqueue (`shedKind: 'wait_projected'`, with `retryAfter`) instead of ending as a `Timeout` at the deadline. Each retry re-queues at the pacer; `withRetry`'s default predicate never retries a pacer shed. |
 | Total deadline | One 50 s budget per tool call, inside the MCP SDK client's 60 s default request timeout. A tool making two upstream calls (cross-refs or get-terms with an uncached record) passes the remaining budget to the second call as its `deadlineMs`, so the pair shares the 50 s. |
 | Fetch boundaries | Plain `fetch` with a per-path accept-list, because a non-2xx is a result on each path: `/search` `[200, 403]` (403 inspected, below); record `[200, 304, 404]` (404 = miss, 304 = revalidation); b-file `[200, 206, 404]`. `redirect: 'manual'` everywhere (a 3xx means a non-canonical path; never follow it to HTML). Every status outside the list → `httpErrorFromResponse(res, { service: 'OEIS' })`, which maps 429 → `RateLimited` with `retryAfter` and 5xx → `ServiceUnavailable`. Per-attempt timeout: `AbortSignal.any([attempt.signal, AbortSignal.timeout(perAttemptMs)])`. Because plain `fetch` throws raw errors, the boundary classifies them: the per-attempt timeout firing → `timeout('OEIS did not answer within {n} s')`; a network failure (`TypeError: fetch failed`, DNS, reset) → `serviceUnavailable('oeis.org is unreachable', …, { cause })`; a caller abort rethrows unchanged. Unwrapped, a final `TypeError` would classify as `InternalError`. |
-| Parse failure | JSON path: a body that is not a JSON object → `serviceUnavailable` with `reason: 'upstream_unparseable'`, retried (an HTML maintenance page is transient). Text path: no `Search:` line (HTML or empty body) → same, retried. A `Search:` line followed by a status line that is none of the three known ones → `serviceUnavailable` with `reason: 'upstream_unparseable'` and `retryable: false`: the format changed, and re-asking returns the same page. Malformed queries do not reach this path — OEIS absorbs them (an unbalanced `"` is dropped; `id:Axyz` answers `No results.`). |
+| Parse failure | JSON path: a body that is not a JSON object → `serviceUnavailable` with `reason: 'upstream_unparseable'`, retried (an HTML maintenance page is transient). Text path: no `Search:` line (HTML or empty body) → same, retried. A `Search:` line followed by a status line that is none of the three known ones → `serviceUnavailable` with `reason: 'upstream_unparseable'` and `retryable: false`: the format changed, and re-asking returns the same page. Record lines (`%N`, `%S`, …) match with the regex `s` flag, so a stray CR or U+2028/U+2029 inside a line stays in the value instead of dropping the line and failing the whole page for a missing `%N`. Malformed queries do not reach this path — OEIS absorbs them (an unbalanced `"` is dropped; `id:Axyz` answers `No results.`). |
 | Search 403 | Body starting `Sign in to see search results` → `validationError('OEIS shows anonymous users only the first 110 results of a query; narrow the query instead of paging deeper.', { reason: 'result_window_exceeded' })`. The schema bound (`start` ≤ 100) makes this unreachable today; it guards an upstream limit change. Any other 403 on any path (an edge or bot-management refusal, typically an HTML body) → `serviceUnavailable('oeis.org refused the request at its edge (HTTP 403).', { reason: 'upstream_refused', retryable: false })`, never `Forbidden`, which would read as the caller's credentials. |
-| 429 | `httpErrorFromResponse` → `RateLimited` with `retryAfter`; `withRetry` honors it and the pacer cooldown closes the gate for every queued caller. |
+| 429 | The fetch boundary passes `data: { reason: 'upstream_rate_limited' }` to `httpErrorFromResponse`, which classifies the 429 as `RateLimited` and copies the `Retry-After` header verbatim into `data.retryAfter` (delta-seconds or an HTTP date; absent when the 429 sends none). `withRetry` and the pacer read that value and never rewrite it. The pacer closes its gate to every queued caller for `min(max(30 s · 2^(k−1), Retry-After), 300 s)` after the k-th consecutive 429. `withRetry` sleeps a `Retry-After` of up to 30 s and fails fast on a longer one or one that outlasts the deadline; with no header it backs off ~2 s, then ~4 s. A 429 that reaches the caller carries the reason, so the `upstream_rate_limited` recovery lands in `content[]`: wait `retryAfter`, or 30 s (the first-429 cooldown) when there is none. A second 429 inside one call usually ends as `pacer_shed` instead, because the doubled cooldown puts the next attempt's queue wait past what the deadline can absorb. |
 | User-Agent | `oeis-mcp-server/<version> (+https://github.com/cyanheads/oeis-mcp-server)`. |
 | Caching | In-process LRU in the service (public data, identical for every caller, so tenant-scoped `ctx.state` would only split the hit rate). Byte budget 64 MiB by serialized length. TTLs: records 24 h, then revalidated with `If-Modified-Since` (a `304` refreshes the TTL without a body); search pages (key: `q`,`sort`,`start`) 1 h; b-file reads 7 days. |
 | Test boundary | `new OeisService({ fetch, now, pacer })` — `fetch` (a `createFetchMock` fake), `now` (clock for cache TTLs), `pacer` (a zero-gap pacer in unit tests; the real one is built in `setup()`). Injected through the constructor, never an env var. `teardown()` disposes the pacer. |
@@ -353,13 +371,33 @@ Decision: build **A** and ship it for local (stdio) use; adopt **D** before any 
 
 **`oeis_get_cross_refs` pages outgoing references and offers `incoming`.** A000045's ten cross-reference lines name 89 distinct A-numbers; resolving them all at 10 per batch and 10 s per request would take ~90 s, past the call deadline, so each page resolves only its 10 in one request. OEIS answers "which entries mention A######" natively, and the record's `references` count confirms the size.
 
-**`oeis_get_sequence` outlines on overflow.** A000045's record is 111 KB of compact JSON (119 KB as served, tab-indented): links 47 KB, comments 32 KB, formulas 18 KB. Most entries fit the 24 KB budget whole. A single section can still exceed the budget when selected (A000045's links); the helper does not sub-outline a section.
+**`oeis_get_sequence` outlines on overflow.** A000045's record is 111 KB of compact JSON (119 KB as served, tab-indented): links 47 KB, comments 32 KB, formulas 18 KB. Most entries fit the 24,000-character budget whole. A single section can still exceed the budget when selected (A000045's links); the helper does not sub-outline a section.
+
+**The outline budget is counted in serialized-JSON characters, and the definitions say so.** `outlineOnOverflow` measures `JSON.stringify(...).length`, which counts UTF-16 code units, not UTF-8 bytes; the framework still labels the size `bytes` (the `sections[].bytes` field, `formatOutline`'s "N bytes", the default notice's "24000-byte budget"). Rather than reimplement the overflow check to measure bytes, the tool description and the `bytes` field description state the real unit. OEIS text is nearly all ASCII, where the two counts agree, and the budget and the per-section sizes share one unit, so the comparison an agent makes between them stays exact.
+
+**Rate-limit recoveries do not depend on seeing `retryAfter`.** The framework renders only `reason`, `retryable`, and the request id into `content[]`, so a client that reads only `content[]` never sees `data.retryAfter`. Both RateLimited recoveries name the field and give a fallback wait of 30 seconds: for `pacer_shed` it is the default queue budget, and the recovery says "backed up" rather than "full" because the pacer also sheds on a projected or elapsed wait; for `upstream_rate_limited` it is the pacer's cooldown after a first 429 with no `Retry-After`. The 429 reason exists because `RateLimited` is not a baseline code: without a declared reason the factory attaches no recovery, and the caller learns neither that OEIS asked it to slow down nor how long to wait. Its recovery says "seconds, or an HTTP date" because `data.retryAfter` is the upstream header verbatim, and RFC 9110 allows both forms.
 
 **Summaries carry the upstream total.** `fmt=text` states it on the status line, so identify and search report `totalCount`.
+
+**The page offset comes from the `Showing` line, not the request.** OEIS clamps a `start` at or past the total to the last page: `seq:1,2,5,14,42,132,429` (26 results) at `start=30` or `start=100` answers `Showing 21-26 of 26` with those six rows. `parseSearchText` therefore returns the served offset (`a − 1` of `Showing a-b`), and identify, search, and incoming cross-refs use it for output `start`, row numbering, `hasMore`/`nextStart`, and the paging notice. Echoing the requested start would number those rows 31–36. When the two differ, a notice names the requested start and the page actually served. The same rule means `No results.` at any `start` is a query with no matches at all (verified at `start=10`, 2026-09-30), so no zero-hit notice suggests retrying at start 0, and no notice exists for a `Showing` page with no rows.
 
 **`oeis_identify_sequence` takes `matchSigns` and `_` wildcards.** `seq:` versus `signed:` and single-term wildcards are both verified upstream; ignoring signs by default keeps a sign-convention difference from hiding the sequence.
 
 **The A-number comes from `number`, never `id`.** `id` is absent, not empty, on entries without legacy M/N numbers.
+
+**Handlers throw `sequence_not_found`; the service does not.** `getRecord` returns `undefined` on a `404`, and each tool's handler throws `ctx.fail('sequence_not_found', …)`, so `data.reason` and the recovery hint come from that tool's own contract entry (whose recovery names the tool's routing targets). The entries therefore carry no `thrownBy: 'service'`.
+
+**Link URLs are web URLs only, and render as plain text.** Link lines are contributor-written HTML, so an href can carry any scheme. Normalization keeps an href in `links[].urls` only when it resolves to `http:` or `https:`; a `javascript:`, `data:`, `mailto:`, or other href is dropped and the line's text kept, so no client is handed a non-web URL to open. `format()` renders each URL as an inline code span, never as a markdown link target, so link text cannot disguise the URL behind it and no URL character is read as markup.
+
+**No non-web href reaches any section.** The same rule covers the rest of the contributor text: `name` (record and search row), `author`, comments, formulas, examples, program code, references, cross-references, extensions, and link text after entity decoding. Normalization removes each `href` attribute whose value (double-, single-, or unquoted, entities decoded, resolved against `https://oeis.org`) is not `http:`/`https:`, so `Cf. <a href="javascript:…">A000032</a>` becomes `Cf. <a>A000032</a>` in `structuredContent` and the blockquote alike, and cross-reference `lines`, `note`, and A-number extraction read the cleaned line. Removing the attribute rather than stripping anchors keeps every other character verbatim, including web anchors and comparison operators in formulas and code. OEIS JSON carries HTML only in `link` lines (none in A000045's 180 comments, 154 formulas, or 10 cross-reference lines), so the rule changes nothing in real records; it bounds what a contributor-written line can hand a client that renders HTML.
+
+**Cross-reference A-numbers are bounded by a word boundary before and a non-digit after: `\bA\d{6,7}(?!\d)`.** OEIS glues function suffixes to the entry that defines them, `A048720bi(21,i)` and `A326722_row(2*n)` (both in `names.gz`, 2026-09-30), and that entry is the related sequence, so a trailing letter or underscore does not stop the match; an eighth digit does. A leading letter does (`xA000032` is not read): OEIS writes a few prefixed forms (`gmA073194`, `packA048680oA054238`, 25 occurrences across 400,195 names), so a prefixed mention in a cross-reference line is missed from `related` and still present in `lines`.
+
+**Every tool is annotated `idempotentHint: true`.** All six are read-only, so repeating a call has no further effect on oeis.org; the rows a search returns can still change as OEIS entries are edited.
+
+**`oeis_get_terms` index bounds are optional.** `firstAvailableIndex` and `lastAvailableIndex` are absent when OEIS publishes no terms (a reserved or recycled A-number's data line can be empty), and a notice says so. A required number there would force either an invented index or an internal error on an otherwise valid record.
+
+**Cross-reference rows always carry `url`.** It is built from the A-number, so an unresolved row still gives the caller a citable address and a direct route to `oeis_get_sequence`; only the upstream-sourced summary fields (name, terms, offset, keywords) go absent.
 
 **Process-global cache instead of `ctx.state`.** The data is public and identical for every tenant; a tenant-scoped cache under JWT auth would fetch the same record once per tenant under a 10 s pace.
 
@@ -447,7 +485,7 @@ Showing 1-10 of 26
 ```
 
 - Status line: `Showing {a}-{b} of {n}` | `No results.` | `Too many results. Please narrow search.` (`keyword:nonn`).
-- The `Search:` line echoes the query lowercased (`id:A008683` → `Search: id:a008683`).
+- The `Search:` line echoes the query lowercased (`id:A008683` → `Search: id:a008683`) and re-tokenized: CR, LF, and `#` in `q` are dropped (`catalan%0D%23%20heading%0Anumbers` → `Search: catalan heading numbers`, 2026-09-30), so `effectiveQuery` never carries a line break into the enrichment trailer.
 - Each page carries the complete internal-format record of every hit (`%I %S %T %U %N %C %D %H %F %e %p %t %o %Y %K %O %A %E`), not just the summary lines: 84–264 KB per 10-hit page measured, and 246 KB for the two-record batch `id:A000045|id:A000108`. The parser reads only `%S %T %U %N %K %O`.
 - Records separated by blank lines; `%S`+`%T`+`%U` concatenate to the full data line (signed values appear directly in `%S`/`%T`/`%U`, e.g. A008683; there are no `%V`/`%W`/`%X` lines).
 - Malformed queries are absorbed, never errors: an unbalanced `"` is dropped (`"fibonacci` → `Search: fibonacci`, 11,408 results); `id:Axyz` → `No results.`
@@ -460,7 +498,7 @@ Showing 1-10 of 26
 - `q=` (blank) → `301 Location: /`.
 - JSON variant (`fmt=json`): bare array of ≤ 10 records in the record shape above, or literal `null` for both "No results" and "Too many results"; no total.
 
-**Search paging bounds.** `start` pages by 10. On `keyword:core` (183 results) `start=90` → "Showing 91-100 of 183", `start=100` → "Showing 101-110 of 183", `start=110` → `403` with the plain-text body `Sign in to see search results past the first 100.` (`content-type: text/plain` under `fmt=text`, `application/json` under `fmt=json`; same at `start=990`, `1000`, `100000`). Every tool's `start` is therefore `z.number().int().min(0).max(100).multipleOf(10)`: at most 110 results per query, and `nextStart` is omitted once `start` reaches 100 even when upstream reports more (the notice then says to narrow the query).
+**Search paging bounds.** `start` pages by 10. On `keyword:core` (183 results) `start=90` → "Showing 91-100 of 183", `start=100` → "Showing 101-110 of 183", `start=110` → `403` with the plain-text body `Sign in to see search results past the first 100.` (`content-type: text/plain` under `fmt=text`, `application/json` under `fmt=json`; same at `start=990`, `1000`, `100000`). Every tool's `start` is therefore `z.number().int().min(0).max(100).multipleOf(10)`: at most 110 results per query, and `nextStart` is omitted once `start` reaches 100 even when upstream reports more (the notice then says to narrow the query). A `start` at or past the total is clamped upstream to the last page: `seq:1,2,5,14,42,132,429` (26 results) at `start=30` and at `start=100` both answer `Showing 21-26 of 26` with those six records (2026-09-30), so the first number of the `Showing` line, not the requested `start`, is the offset of the rows returned.
 
 **`GET /A######/b######.txt`** — b-file, `text/plain`.
 
