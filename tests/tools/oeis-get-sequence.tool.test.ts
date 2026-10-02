@@ -1,8 +1,10 @@
 /**
  * @fileoverview Tests for oeis_get_sequence through the tool contract over a real OeisService with
- * a scripted fetch: A-number and sections input, the sequence_not_found and pacer_shed contracts,
- * upstream failure classes, the lifecycle notice, section selection, the 24,000-byte outline,
- * sparse records, link-scheme filtering, and `format()` parity with `structuredContent`.
+ * a scripted fetch: A-number, sections, and fromItem input, the sequence_not_found, pacer_shed, and
+ * from_item_not_selected contracts, upstream failure classes, the lifecycle notice, section
+ * selection, the 24,000-byte outline, a selection cut at the 100,000-byte response budget and walked
+ * to its end with nextFromItem, sparse records, link-scheme filtering, and `format()` parity with
+ * `structuredContent`.
  * @module tests/tools/oeis-get-sequence.tool.test
  */
 
@@ -17,8 +19,11 @@ import {
 } from '@/mcp-server/tools/definitions/oeis-get-sequence.tool.js';
 import { normalizeRecord } from '@/services/oeis/normalize-record.js';
 import { OeisService } from '@/services/oeis/oeis-service.js';
-import { SECTION_NAMES } from '@/services/oeis/types.js';
+import { SECTION_NAMES, type SectionName } from '@/services/oeis/types.js';
+import { catalanRecordJson } from '../fixtures/a000108-record.js';
+import { cpuMsAsync } from '../fixtures/cpu-time.js';
 import {
+  capturedSearchRecords,
   fibonacciRecordJson,
   htmlMaintenanceBody,
   minimalRecordJson,
@@ -26,6 +31,7 @@ import {
   recordBody,
   recordWith,
   reservedRecordJson,
+  searchPageText,
 } from '../fixtures/oeis-upstream.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, queryOf, serviceOver, withBackoff } from '../fixtures/tool-service.js';
@@ -77,6 +83,116 @@ function sectionsLength(raw: RawRecord): number {
     crossReferences,
     extensions,
   }).length;
+}
+
+/** The response budget a cut selection stays within. */
+const BUDGET = 100_000;
+const encoder = new TextEncoder();
+
+/** UTF-8 bytes a caller receives: the structuredContent JSON plus the text of every content[] block. */
+function responseBytes(result: Result): number {
+  return (
+    encoder.encode(JSON.stringify(result.structuredContent)).length +
+    result.content.reduce(
+      (sum, block) => sum + ('text' in block ? encoder.encode(block.text).length : 0),
+      0,
+    )
+  );
+}
+
+/** A position in a selection, as nextFromItem reports it and fromItem takes it. */
+type ItemPosition = { index: number; section: SectionName };
+
+/** The `format()` heading of each section. */
+const HEADINGS: Record<SectionName, string> = {
+  comments: 'Comments',
+  formulas: 'Formulas',
+  examples: 'Examples',
+  programs: 'Programs',
+  references: 'References',
+  links: 'Links',
+  crossReferences: 'Cross-references',
+  extensions: 'Extensions',
+};
+
+/**
+ * Walks a selection to its end over one scripted record: each call passes the previous response's
+ * nextFromItem back unchanged as fromItem, through the tool's own input parsing. Returns every
+ * response and the upstream calls made.
+ */
+async function walkSelection(raw: RawRecord, aNumber: string, sections: readonly SectionName[]) {
+  const { calls, service } = serviceOver(ok(raw));
+  holder.service = service;
+  const pages: Result[] = [];
+  let fromItem: unknown;
+  do {
+    const input = { aNumber, sections: [...sections], ...(fromItem !== undefined && { fromItem }) };
+    expect(oeisGetSequence.input.parse(input).fromItem).toEqual(fromItem);
+    const result = await runToolContract(oeisGetSequence, input as never);
+    expect(result.isError).toBeUndefined();
+    pages.push(result);
+    fromItem = structured(result).nextFromItem;
+  } while (fromItem !== undefined && pages.length < 50);
+  return { calls, pages };
+}
+
+/** The items a walk's responses carried, in order, each tagged with its section. */
+function walkedItems(pages: readonly Result[]): { item: unknown; section: SectionName }[] {
+  return pages.flatMap((page) => {
+    const out = structured(page);
+    return SECTION_NAMES.flatMap((section) =>
+      ((out[section] as unknown[] | undefined) ?? []).map((item) => ({ item, section })),
+    );
+  });
+}
+
+/** Every item of the selected sections of a record, in record order, each tagged with its section. */
+function selectedItems(raw: RawRecord, sections: readonly SectionName[]) {
+  const record = normalizeRecord(raw);
+  return SECTION_NAMES.filter((section) => sections.includes(section)).flatMap((section) =>
+    (record[section] as unknown[]).map((item) => ({ item, section })),
+  );
+}
+
+/**
+ * Asserts a walk from the start of a selection delivered every selected item exactly once, in
+ * record order, with each response within the budget; that every response but the last carries
+ * nextFromItem (in structuredContent, the content[] text, and the cut notice) pointing at the item
+ * the next response starts with; that each continuation omits the selected sections before
+ * fromItem.section from both surfaces; and that the last response has neither nextFromItem nor a
+ * notice.
+ */
+function expectCompleteWalk(
+  pages: readonly Result[],
+  raw: RawRecord,
+  sections: readonly SectionName[],
+) {
+  expect(walkedItems(pages)).toEqual(selectedItems(raw, sections));
+  pages.forEach((page, i) => {
+    const out = structured(page);
+    expect(responseBytes(page), `response ${i}`).toBeLessThanOrEqual(BUDGET);
+    const following = pages[i + 1];
+    if (!following) {
+      expect(out, `response ${i}`).not.toHaveProperty('nextFromItem');
+      expect(out, `response ${i}`).not.toHaveProperty('notice');
+      return;
+    }
+    const next = out.nextFromItem as ItemPosition;
+    const delivered = walkedItems(pages.slice(0, i + 1)).filter((x) => x.section === next.section);
+    expect(delivered, `response ${i}`).toHaveLength(next.index);
+    expect(out.notice).toContain(`fromItem ${JSON.stringify(next)}`);
+    expect(textOf(page)).toContain(out.notice as string);
+    expect(textOf(page)).toContain(
+      `**Next:** call again with the same sections and fromItem ${JSON.stringify(next)}.`,
+    );
+    const continued = structured(following);
+    for (const section of SECTION_NAMES.slice(0, SECTION_NAMES.indexOf(next.section))) {
+      expect(continued, `response ${i + 1}`).not.toHaveProperty(section);
+      expect(textOf(following)).not.toMatch(new RegExp(`^## ${HEADINGS[section]}$`, 'm'));
+    }
+    expect(continued).toHaveProperty(next.section);
+    expect(textOf(following)).toMatch(new RegExp(`^## ${HEADINGS[next.section]}$`, 'm'));
+  });
 }
 
 afterEach(() => {
@@ -226,6 +342,33 @@ describe('oeis_get_sequence', () => {
       expect(again.isError).toBeUndefined();
       expect(calls).toHaveLength(1);
     });
+
+    it('serves the newer record once a freshly fetched search row shows a later edit', async () => {
+      const editedRow = capturedSearchRecords.A000045.replace(
+        '#2594 Sep 23 2026 16:08:09',
+        '#2595 Oct 01 2026 18:00:00',
+      );
+      const searchPage = searchPageText({
+        query: 'keyword:core',
+        status: 'Showing 1-1 of 1',
+        records: [editedRow],
+      });
+      const newer = recordWith({ revision: 903, time: '2026-10-01T18:00:00-04:00' });
+      const { calls, service } = serviceOver(ok(), res(searchPage, { status: 200 }), ok(newer));
+      holder.service = service;
+      const before = await runToolContract(oeisGetSequence, { aNumber: 'A000045' });
+      expect(structured(before).revision).toBe(902);
+
+      await service.search({ q: 'keyword:core', sort: 'modified', start: 0 }, createMockContext());
+      expect(calls).toHaveLength(2);
+      const after = await runToolContract(oeisGetSequence, { aNumber: 'A000045' });
+      expect(calls).toHaveLength(3);
+      expect(structured(after)).toMatchObject({
+        revision: 903,
+        modified: '2026-10-01T18:00:00-04:00',
+      });
+      expect(textOf(after)).toContain('**Revision:** 903');
+    });
   });
 
   describe('sparse record', () => {
@@ -308,14 +451,285 @@ describe('oeis_get_sequence', () => {
       expect(textOf(result).match(/## Formulas/g)).toHaveLength(1);
     });
 
-    it('returns a selection whole however large it is, never an outline', async () => {
+    it('cuts a selection past the response budget between items, never to an outline', async () => {
       const { result } = await fetchSequence(
         { aNumber: 'A388000', sections: ['comments'] },
-        ok(withComment(60_000)),
+        ok(recordWith({ comment: ['x'.repeat(30_000), 'y'.repeat(30_000)] }, minimalRecordJson)),
       );
-      expect(structured(result).kind).toBe('full');
-      expect((structured(result).comments as string[])[0]).toHaveLength(60_000);
-      expect(structured(result).sections).toBeUndefined();
+      const out = structured(result);
+      expect(out.kind).toBe('full');
+      expect(out.comments).toEqual(['x'.repeat(30_000)]);
+      expect(out.nextFromItem).toEqual({ section: 'comments', index: 1 });
+      expect(out.sections).toBeUndefined();
+      expect(out.outlineNotice).toBeUndefined();
+      expect(responseBytes(result)).toBeLessThanOrEqual(BUDGET);
+    });
+  });
+
+  describe('selection past the 100,000-byte response budget', () => {
+    it('returns all 375 A000108 links in two calls, in order, each within the budget', async () => {
+      const { calls, pages } = await walkSelection(catalanRecordJson, 'A000108', ['links']);
+      expect(pages).toHaveLength(2);
+      expectCompleteWalk(pages, catalanRecordJson, ['links']);
+      expect(calls).toHaveLength(1);
+
+      const first = structured(pages[0] as Result);
+      const next = first.nextFromItem as ItemPosition;
+      expect(next).toEqual({ section: 'links', index: (first.links as unknown[]).length });
+      expect(first.kind).toBe('full');
+      expect(first.notice).toBe(
+        `Stopped before links[${next.index}] (links has 375 items) to stay within the 100,000-byte response budget; call again with the same sections and fromItem ${JSON.stringify(next)}.`,
+      );
+      expect(structured(pages[1] as Result).links).toHaveLength(375 - next.index);
+    });
+
+    it('walks all eight A000108 sections to the end, each continuation omitting the sections before fromItem.section', async () => {
+      const { calls, pages } = await walkSelection(catalanRecordJson, 'A000108', SECTION_NAMES);
+      expect(pages).toHaveLength(3);
+      expectCompleteWalk(pages, catalanRecordJson, SECTION_NAMES);
+      expect(calls).toHaveLength(1);
+    });
+
+    it('returns a selection under the budget whole, with no nextFromItem or cut notice', async () => {
+      const { result } = await fetchSequence(
+        { aNumber: 'A000108', sections: ['formulas', 'programs'] },
+        ok(catalanRecordJson),
+      );
+      const out = structured(result);
+      const record = normalizeRecord(catalanRecordJson);
+      expect(out.formulas).toEqual(record.formulas);
+      expect(out.programs).toEqual(record.programs);
+      expect(out).not.toHaveProperty('nextFromItem');
+      expect(out).not.toHaveProperty('notice');
+      expect(textOf(result)).not.toContain('**Next:**');
+      expect(responseBytes(result)).toBeLessThanOrEqual(BUDGET);
+    });
+
+    it('measures the whole response: exactly 100,000 bytes stays whole, one byte more is cut', async () => {
+      // A dead entry, so the lifecycle notice in structuredContent and the content[] trailer counts.
+      const tail = ['y'.repeat(300), 'z'.repeat(1_000)];
+      const run = (filler: string) =>
+        fetchSequence(
+          { aNumber: 'A388000', sections: ['comments'] },
+          ok(recordWith({ keyword: 'nonn,dead', comment: [filler, ...tail] }, minimalRecordJson)),
+        );
+      const base = responseBytes((await run('x'.repeat(40_000))).result);
+      // Each "x" adds 2 bytes (one per surface); a '"' adds 3, escaped in the JSON.
+      const filler = (extra: number) =>
+        '"'.repeat(extra % 2) + 'x'.repeat(40_000 + (extra - 3 * (extra % 2)) / 2);
+
+      const atBudget = await run(filler(BUDGET - base));
+      expect(responseBytes(atBudget.result)).toBe(BUDGET);
+      expect(structured(atBudget.result).comments).toHaveLength(3);
+      expect(structured(atBudget.result)).not.toHaveProperty('nextFromItem');
+      expect(structured(atBudget.result).notice).toContain('withdrawn');
+
+      const over = await run(filler(BUDGET - base + 1));
+      const out = structured(over.result);
+      expect(out.comments).toEqual([filler(BUDGET - base + 1), tail[0]]);
+      expect(out.nextFromItem).toEqual({ section: 'comments', index: 2 });
+      expect(responseBytes(over.result)).toBeLessThanOrEqual(BUDGET);
+      // One notice carries the lifecycle guidance and the cut.
+      const notice = out.notice as string;
+      expect(notice).toContain('withdrawn (keyword dead)');
+      expect(notice).toContain('fromItem {"section":"comments","index":2}');
+      expect(textOf(over.result)).toContain(`> ${notice}`);
+    });
+
+    it('returns a single item over the budget alone, nextFromItem pointing at the next item', async () => {
+      const big = 'x'.repeat(120_000);
+      const raw = recordWith({ comment: ['a', big, 'b'] }, minimalRecordJson);
+      const { calls, pages } = await walkSelection(raw, 'A388000', ['comments']);
+      expect(pages.map((page) => structured(page).comments)).toEqual([['a'], [big], ['b']]);
+      expect(pages.map((page) => structured(page).nextFromItem)).toEqual([
+        { section: 'comments', index: 1 },
+        { section: 'comments', index: 2 },
+        undefined,
+      ]);
+      expect(responseBytes(pages[1] as Result)).toBeGreaterThan(BUDGET);
+      expect(calls).toHaveLength(1);
+    });
+
+    it('fills each cut part to within one item of the budget', async () => {
+      // Each item costs 2,007 bytes: 1,003 of JSON (the string and its comma) and 1,004 of text
+      // ("\n\n> " and the line), so a part filled as far as it goes leaves less than that unused.
+      const raw = recordWith(
+        { comment: Array.from({ length: 150 }, () => 'x'.repeat(1_000)) },
+        minimalRecordJson,
+      );
+      const { pages } = await walkSelection(raw, 'A388000', ['comments']);
+      expect(pages).toHaveLength(4);
+      expectCompleteWalk(pages, raw, ['comments']);
+      for (const page of pages.slice(0, -1)) {
+        expect(BUDGET - responseBytes(page)).toBeLessThan(2_007);
+      }
+    });
+
+    it('measures a cut in time bounded by the budget, not by the size of the selection', async () => {
+      // 400,000 formula lines, far past what the 4 MiB record fetch admits, injected past the service:
+      // the parts a call measures stay near the budget in size, so its cost does not grow with them.
+      const record = normalizeRecord(
+        recordWith(
+          {
+            formula: Array.from({ length: 400_000 }, (_, i) => `a(${i}) = a(${i}-1) + a(${i}-2).`),
+          },
+          minimalRecordJson,
+        ),
+      );
+      holder.service = { getRecord: async () => record };
+      const input = { aNumber: 'A388000', sections: ['formulas'] };
+      await runToolContract(oeisGetSequence, input as never);
+      const cpu = await cpuMsAsync(() => runToolContract(oeisGetSequence, input as never));
+      expect(cpu).toBeLessThan(150);
+    });
+
+    it('cuts examples and program blocks between items, each part closing its own fence', async () => {
+      const raw = recordWith(
+        {
+          example: ['e'.repeat(30_000), 'a ``` inside', 'f'.repeat(30_000)],
+          maple: ['m'.repeat(30_000)],
+          mathematica: ['M'.repeat(30_000)],
+        },
+        minimalRecordJson,
+      );
+      const { pages } = await walkSelection(raw, 'A388000', ['examples', 'programs']);
+      expect(pages.length).toBeGreaterThan(2);
+      expectCompleteWalk(pages, raw, ['examples', 'programs']);
+      for (const page of pages) {
+        const fences = textOf(page)
+          .split('\n')
+          .filter((line) => line.startsWith('```'));
+        expect(fences.length % 2).toBe(0);
+      }
+    });
+
+    it('walks the selected sections in record order whatever order sections lists them in', async () => {
+      const { result } = await fetchSequence(
+        {
+          aNumber: 'A45',
+          sections: ['links', 'comments', 'formulas'],
+          fromItem: { section: 'formulas', index: 1 },
+        },
+        ok(),
+      );
+      const out = structured(result);
+      expect(out).not.toHaveProperty('comments');
+      expect(out.formulas).toEqual(['a(n) = a(n-1) + a(n-2) for n >= 2.']);
+      expect(out.links).toHaveLength(2);
+      expect(Object.keys(out).indexOf('formulas')).toBeLessThan(Object.keys(out).indexOf('links'));
+      expect(out).not.toHaveProperty('nextFromItem');
+      expect(out).not.toHaveProperty('notice');
+      expect(textOf(result)).not.toContain('## Comments');
+    });
+
+    it('accepts a fromItem at the start of a selection, the same as no fromItem', async () => {
+      const plain = await fetchSequence({ aNumber: 'A45', sections: ['formulas'] }, ok());
+      const started = await fetchSequence(
+        { aNumber: 'A45', sections: ['formulas'], fromItem: { section: 'formulas', index: 0 } },
+        ok(),
+      );
+      expect(started.result).toEqual(plain.result);
+    });
+
+    it('returns [] for a fromItem past the end of its section, with its item count, and the later selected sections', async () => {
+      const { result } = await fetchSequence(
+        {
+          aNumber: 'A45',
+          sections: ['comments', 'formulas'],
+          fromItem: { section: 'comments', index: 9 },
+        },
+        ok(),
+      );
+      const out = structured(result);
+      expect(out.comments).toEqual([]);
+      expect(out.formulas).toHaveLength(2);
+      expect(out).not.toHaveProperty('nextFromItem');
+      expect(out.notice).toBe(
+        'fromItem.index 9 is past the end of comments, which has 2 items, so comments comes back empty.',
+      );
+      const text = textOf(result);
+      expect(text).toContain('## Comments\n\nNone.');
+      expect(text).toContain('## Formulas');
+      expect(text).toContain(`> ${out.notice as string}`);
+    });
+
+    it('returns only [] for a fromItem past the end of the last selected section', async () => {
+      const { result } = await fetchSequence(
+        {
+          aNumber: 'A45',
+          sections: ['comments', 'formulas'],
+          fromItem: { section: 'formulas', index: 2 },
+        },
+        ok(),
+      );
+      const out = structured(result);
+      expect(out.formulas).toEqual([]);
+      expect(out).not.toHaveProperty('comments');
+      expect(out.notice).toContain('formulas, which has 2 items');
+    });
+  });
+
+  describe('fromItem input', () => {
+    it.each([
+      ['without sections', { fromItem: { section: 'links', index: 3 } }],
+      ['with an empty selection', { sections: [], fromItem: { section: 'links', index: 3 } }],
+      [
+        'naming an unselected section',
+        { sections: ['formulas'], fromItem: { section: 'links', index: 3 } },
+      ],
+    ])('rejects fromItem %s as from_item_not_selected with no request', async (_label, input) => {
+      const { calls, result } = await fetchSequence({ aNumber: 'A45', ...input }, ok());
+      expect(result.isError).toBe(true);
+      const error = errorOf(result);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'from_item_not_selected',
+          fromItem: { section: 'links', index: 3 },
+          recovery: { hint: expect.stringContaining('same sections') },
+        },
+      });
+      expect(error.message).toContain('links');
+      expect(textOf(result)).toContain('same sections');
+      expect(calls).toHaveLength(0);
+    });
+
+    it.each([
+      ['an unknown section', { section: 'formula', index: 0 }],
+      ['a negative index', { section: 'links', index: -1 }],
+      ['a fractional index', { section: 'links', index: 1.5 }],
+      ['a missing index', { section: 'links' }],
+      ['a string cursor', 'links:5'],
+    ])(
+      'rejects %s at the schema with invalid_arguments and no request',
+      async (_label, fromItem) => {
+        const { calls, result } = await fetchSequence(
+          { aNumber: 'A45', sections: ['links'], fromItem },
+          ok(),
+        );
+        const error = errorOf(result);
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_arguments' },
+        });
+        // The failure is inside fromItem, not an unrecognized key at the root.
+        const issues = error.data.issues as { path: PropertyKey[] }[];
+        expect(issues.length).toBeGreaterThan(0);
+        for (const issue of issues) expect(issue.path[0]).toBe('fromItem');
+        expect(calls).toHaveLength(0);
+      },
+    );
+
+    it('reads a blank fromItem as unset (form clients send "")', async () => {
+      for (const fromItem of ['', '   ', undefined]) {
+        expect(oeisGetSequence.input.parse({ aNumber: 'A45', fromItem }).fromItem).toBeUndefined();
+        const { result } = await fetchSequence(
+          { aNumber: 'A45', sections: ['formulas'], fromItem },
+          ok(),
+        );
+        expect(result.isError).toBeUndefined();
+        expect(structured(result).formulas).toHaveLength(2);
+      }
     });
   });
 
@@ -382,6 +796,21 @@ describe('oeis_get_sequence', () => {
       expect(structured(second).kind).toBe('full');
       expect(structured(second).formulas).toHaveLength(2);
       expect(structured(second).sections).toBeUndefined();
+    });
+
+    it('says a large selection comes back in parts, never that a selection returns whatever it names', async () => {
+      const { result } = await fetchSequence({ aNumber: 'A000108' }, ok(catalanRecordJson));
+      const out = structured(result);
+      expect(out.kind).toBe('outline');
+      const notice = out.outlineNotice as string;
+      expect(notice).not.toContain('whatever it names');
+      expect(notice).toContain('nextFromItem');
+      expect(notice).toContain('100,000-byte response budget');
+      // The worked example is the largest section that fits the outline budget.
+      const sections = out.sections as { bytes: number; name: string }[];
+      const example = sections.find((section) => section.bytes <= 24_000);
+      expect(notice).toContain(`sections:["${example?.name}"] (size ${example?.bytes}`);
+      expect(textOf(result)).toContain(notice);
     });
 
     it('buildSequenceOutput with outline: false returns every section whatever the size', () => {
@@ -681,6 +1110,7 @@ describe('oeis_get_sequence', () => {
     it('declares every contract with the codes the design names', () => {
       expect(oeisGetSequence.errors?.map((e) => [e.reason, e.code])).toEqual([
         ['sequence_not_found', JsonRpcErrorCode.NotFound],
+        ['from_item_not_selected', JsonRpcErrorCode.InvalidParams],
         ['pacer_shed', JsonRpcErrorCode.RateLimited],
         ['upstream_rate_limited', JsonRpcErrorCode.RateLimited],
       ]);

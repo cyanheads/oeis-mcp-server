@@ -1,13 +1,14 @@
 /**
  * @fileoverview Tests for the oeis://sequence/{aNumber} resource over a real OeisService with a
- * scripted fetch: URI matching and A-number normalization, the whole-entry (never outlined) JSON,
- * parity with oeis_get_sequence, link-scheme filtering, the sequence_not_found contract for an
+ * scripted fetch: URI matching and A-number normalization, the whole-entry JSON (never outlined, and
+ * never cut where the tool cuts a selection), parity with oeis_get_sequence, link-scheme filtering,
+ * the sequence_not_found contract for an
  * unknown A-number, malformed A-numbers rejected before any request, and upstream failure classes.
  * @module tests/resources/oeis-sequence.resource.test
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { createPacer } from '@cyanheads/mcp-ts-core/utils';
 import { UriTemplate } from '@modelcontextprotocol/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -41,6 +42,16 @@ vi.mock('@/services/oeis/oeis-service.js', async (importOriginal) => ({
 const record = (raw: RawRecord = fibonacciRecordJson) =>
   res(recordBody(raw), { status: 200, headers: { 'content-type': 'application/json' } });
 const missing = () => res('<html>Not found</html>', { status: 404 });
+
+/**
+ * 375 link lines shaped like OEIS's (the count A000108 carries), together far past the
+ * 100,000-byte response budget oeis_get_sequence cuts a selection at.
+ */
+const manyLinks = Array.from(
+  { length: 375 },
+  (_, i) =>
+    `A. Author ${i}, <a href="https://example.org/papers/${i}.pdf">On structure number ${i}, a long descriptive title of the kind OEIS link lines carry</a>, J. Example Math. ${i % 40} (2020), ${i}-${i + 20}.`,
+);
 
 /** Reads the resource the way a client would: match the URI, validate params, run the handler. */
 async function read(uri: string, ...steps: ReturnType<typeof res>[]) {
@@ -229,6 +240,37 @@ describe('oeis://sequence/{aNumber}', () => {
         createMockContext({ errors: oeisGetSequence.errors }),
       );
       expect(viaTool.kind).toBe('outline');
+    });
+
+    it('returns every link of an entry whose links overflow the tool response budget', async () => {
+      const raw = recordWith({ link: manyLinks }, minimalRecordJson);
+      const { output } = await read('oeis://sequence/A388000', record(raw));
+      const entry = output as Record<string, unknown> & { links: { text: string }[] };
+      expect(entry.kind).toBe('full');
+      expect(entry.links).toHaveLength(375);
+      expect(entry.links.map((link) => link.text.split(',')[0])).toEqual(
+        manyLinks.map((_, i) => `A. Author ${i}`),
+      );
+      expect(entry).not.toHaveProperty('nextFromItem');
+      expect(entry).not.toHaveProperty('notice');
+      expect(oeisGetSequence.output.safeParse(output).success).toBe(true);
+    });
+
+    it('stays whole where oeis_get_sequence cuts the same links selection between items', async () => {
+      const raw = recordWith({ link: manyLinks }, minimalRecordJson);
+      const { service } = serviceOver(record(raw));
+      holder.service = service;
+      const viaTool = await runToolContract(oeisGetSequence, {
+        aNumber: 'A388000',
+        sections: ['links'],
+      });
+      const cut = viaTool.structuredContent as { links: unknown[]; nextFromItem?: unknown };
+      expect(cut.links.length).toBeLessThan(375);
+      expect(cut.nextFromItem).toEqual({ section: 'links', index: cut.links.length });
+
+      const { output } = await read('oeis://sequence/A388000', record(raw));
+      expect((output as { links: unknown[] }).links).toHaveLength(375);
+      expect(output).not.toHaveProperty('nextFromItem');
     });
 
     it('serializes to JSON without loss', async () => {
