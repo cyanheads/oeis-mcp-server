@@ -8,6 +8,7 @@
 import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { describe, expect, it } from 'vitest';
 import { normalizeRecord, toANumber } from '@/services/oeis/normalize-record.js';
+import { cpuMs } from '../../fixtures/cpu-time.js';
 import {
   fibonacciRecordJson,
   minimalRecordJson,
@@ -511,9 +512,7 @@ describe('normalizeRecord', () => {
       ['a run of "<a " in a link line', { link: ['<a '.repeat(MIB / 4)] }],
     ])('normalizes 1 MiB of %s in linear time', (_shape, override) => {
       const raw = recordWith(override);
-      const started = performance.now();
-      normalizeRecord(raw);
-      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(cpuMs(() => normalizeRecord(raw))).toBeLessThan(1_000);
     });
   });
 });
