@@ -4,7 +4,7 @@
 **Version:** 0.1.1
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -21,11 +21,11 @@ Six read-only tools and one resource over oeis.org, the On-Line Encyclopedia of 
 |:--------------|:-------|:--------|
 | `/A######?fmt=json` | One record as JSON | `oeis_get_sequence`, `oeis://sequence/{aNumber}`, `oeis_get_cross_refs` outgoing, `oeis_get_terms` when the entry has no b-file |
 | `/search?q=…&fmt=text` | Internal format, 10 records per page | `oeis_identify_sequence`, `oeis_search_sequences`, `oeis_get_cross_refs` (outgoing names, incoming) |
-| `/A######/b######.txt` | b-file, first 1 MiB read | `oeis_get_terms` |
+| `/A######/b######.txt` | b-file, read in 1 MiB pages: the first always, a later one by byte range with `If-Range` when `fromIndex` lies past the first | `oeis_get_terms` |
 
 `oeis_list_reference` serves static tables and makes no upstream call. There are no prompts.
 
-`OeisService` (`src/services/oeis/oeis-service.ts`) owns every upstream request: one process-wide pacer (`minStartGapMs: 10_000`, `maxConcurrent: 1`, a cooldown after a `429`), a `withRetry` boundary with a 50 s per-call deadline, per-path accept-list fetch boundaries with `redirect: 'manual'`, and a 64 MiB in-process LRU (records 24 h, then revalidated with `If-Modified-Since`; a record `404` 1 h; search pages 1 h; b-file reads 7 days). The cache is process-global rather than `ctx.state` on purpose: the data is public and identical for every tenant. `OEIS_QUEUE_MAX_WAIT_MS` is the only server-specific env var; the 10 s pace is oeis.org's rule and is not configurable.
+`OeisService` (`src/services/oeis/oeis-service.ts`) owns every upstream request: one process-wide pacer (`minStartGapMs: 10_000`, `maxConcurrent: 1`, a cooldown after a `429`), a `withRetry` boundary with a 50 s per-call deadline, per-path accept-list fetch boundaries with `redirect: 'manual'`, and a 64 MiB in-process LRU (records 24 h, or until a freshly fetched search row shows a later edit, then revalidated with `If-Modified-Since`; a record `404` 1 h, or until such a row lists the A-number; search pages 1 h; b-file pages 7 days, later pages keyed by the first page's ETag). The cache is process-global rather than `ctx.state` on purpose: the data is public and identical for every tenant. `OEIS_QUEUE_MAX_WAIT_MS` is the only server-specific env var; the 10 s pace is oeis.org's rule and is not configurable.
 
 Conventions every definition follows:
 
@@ -34,7 +34,7 @@ Conventions every definition follows:
 - **Terms are decimal strings**, never JSON numbers; values routinely pass 2^53.
 - **Upstream text is data.** Names, comments, formulas, examples, programs, references, and links are contributor-written: render them in `format()` only through `inline()`, `blockquote()`, or `fence()` from `src/mcp-server/shared/markdown.ts`, and URLs as code spans, never as markdown link targets. `inline()` and `blockquote()` escape link, image, link-definition, and HTML openers, so contributor markup renders as text; `structuredContent` keeps every string as normalized.
 - **Attribution.** Every record and summary row carries its `https://oeis.org/A######` `url`; keep it on any new output shape.
-- **No fabrication.** A field OEIS leaves out stays absent: `offset` on a reserved or recycled A-number, `matchStartIndex` when the run is not in the data line, the name and terms of an unresolved cross-reference row.
+- **No fabrication.** A field OEIS leaves out stays absent: `offset` on a reserved or recycled A-number and `author` on its summary row, `modified` and `legacyIds` on a row whose `%I` line is missing or unreadable, `matchStartIndex` when the run is not in the data line, the name and terms of an unresolved cross-reference row.
 - **Errors.** Each definition declares `pacer_shed` and `upstream_rate_limited` (`RateLimited`, `thrownBy: 'service'`) with a recovery naming that tool. `sequence_not_found` is thrown by the handler through `ctx.fail` when `getRecord` returns `undefined`, never by the service.
 
 ---
@@ -91,7 +91,10 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
   input: z.object({
     aNumber: ANumberSchema,
     sections: blankAsUnset(z.array(z.enum(SECTION_NAMES)).optional()).describe(
-      'Sections to return with the core fields, whatever their size, e.g. ["formulas", "programs"]. …',
+      'Sections to return with the core fields, e.g. ["formulas", "programs"]. A selection past the 100,000-byte response budget is cut between items; fromItem continues it. …',
+    ),
+    fromItem: blankAsUnset(ItemPositionSchema.optional()).describe(
+      "Where to resume a cut selection: the previous response's nextFromItem, passed unchanged with the same sections. …",
     ),
   }),
   output: SequenceOutputSchema,
@@ -99,7 +102,9 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
     notice: z
       .string()
       .optional()
-      .describe('Guidance when the entry is withdrawn (dead) or its A-number is reserved or recycled.'),
+      .describe(
+        'Guidance: the entry is withdrawn (dead) or its A-number reserved or recycled; where a cut selection stopped and the call that continues it; or that fromItem lies past the end of its section.',
+      ),
   },
   errors: [
     {
@@ -109,19 +114,37 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
       recovery:
         'No OEIS entry has this A-number; find the right one with oeis_search_sequences or oeis_identify_sequence.',
     },
+    {
+      reason: 'from_item_not_selected',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'fromItem is given without sections, or names a section that sections does not select.',
+      recovery:
+        'Pass fromItem with the same sections as the call that returned it as nextFromItem; its section must be one of them.',
+    },
     // pacer_shed and upstream_rate_limited: RateLimited, retryable, thrownBy: 'service'
   ],
 
   async handler(input, ctx) {
-    const record = await getOeisService().getRecord(input.aNumber, ctx);
-    if (!record) {
-      throw ctx.fail('sequence_not_found', `OEIS has no entry ${input.aNumber}.`, {
-        aNumber: input.aNumber,
-      });
+    const { aNumber, fromItem, sections } = input;
+    if (fromItem && !sections?.includes(fromItem.section)) {
+      throw ctx.fail(
+        'from_item_not_selected',
+        `fromItem names ${fromItem.section}, which sections does not select (…).`,
+        { fromItem, sections: sections ?? [] },
+      );
     }
-    const notice = lifecycleNotice(record.keywords);
+    const record = await getOeisService().getRecord(aNumber, ctx);
+    if (!record) {
+      throw ctx.fail('sequence_not_found', `OEIS has no entry ${aNumber}.`, { aNumber });
+    }
+    const lifecycle = lifecycleNotice(record.keywords);
+    if (!sections?.length) {
+      if (lifecycle) ctx.enrich.notice(lifecycle);
+      return buildSequenceOutput(record, { outline: true });
+    }
+    const { notice, output } = pageSelection(record, sections, fromItem, lifecycle);
     if (notice) ctx.enrich.notice(notice);
-    return buildSequenceOutput(record, { outline: true, sections: input.sections });
+    return output;
   },
 
   // format() populates content[] — the markdown twin of structuredContent.
@@ -280,7 +303,7 @@ errors: [
 async handler(input, ctx) {
   const record = await getOeisService().getRecord(input.aNumber, ctx);
   if (!record) throw ctx.fail('sequence_not_found', `OEIS has no entry ${input.aNumber}.`);
-  return buildSequenceOutput(record, { outline: true, sections: input.sections });
+  // … the full entry or an outline, or a page of the selected sections (see the Tool pattern)
 }
 ```
 
@@ -325,6 +348,7 @@ src/
     shared/
       oeis-schemas.ts                     # ANumberSchema, blankAsUnset, pageStartSchema, SequenceSummarySchema
       markdown.ts                         # inline / blockquote / fence helpers for contributor text
+      data-line-limit.ts                  # Data-line trigger and sentence for the term-matching zero-hit notices
     tools/definitions/
       index.ts                            # allToolDefinitions barrel
       oeis-identify-sequence.tool.ts
