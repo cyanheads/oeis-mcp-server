@@ -1,6 +1,6 @@
 {
   "name": "oeis-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs.",
   "author": {
     "name": "cyanheads",

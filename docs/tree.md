@@ -1,6 +1,6 @@
 # oeis-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 05:40:07
+Generated on: 2026-10-02 05:14:14
 
 ```text
 oeis-mcp-server/
@@ -141,6 +141,7 @@ oeis-mcp-server/
 │   │   │       ├── index.ts
 │   │   │       └── oeis-sequence.resource.ts
 │   │   ├── shared/
+│   │   │   ├── data-line-limit.ts
 │   │   │   ├── markdown.ts
 │   │   │   └── oeis-schemas.ts
 │   │   └── tools/
@@ -162,6 +163,8 @@ oeis-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
+│   │   ├── a000108-record.ts
+│   │   ├── cpu-time.ts
 │   │   ├── oeis-upstream.ts
 │   │   ├── scripted-fetch.ts
 │   │   └── tool-service.ts
