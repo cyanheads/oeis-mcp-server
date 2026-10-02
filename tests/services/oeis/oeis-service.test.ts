@@ -19,21 +19,37 @@ import {
 } from '@/services/oeis/oeis-service.js';
 import {
   bFileText,
+  capturedSearchRecords,
   FIBONACCI_LAST_MODIFIED,
   fibonacciBFile,
   fibonacciRecordJson,
   htmlMaintenanceBody,
+  LUCAS_ETAG,
+  longLineBFile,
+  lucasBFile,
   minimalRecordJson,
   noResultsSearchPage,
   oversizedBFile,
   recordBody,
   recordWith,
   resultsSearchPage,
+  SIGMA_ETAG,
+  searchPageText,
+  sigmaBFile,
+  sigmaOf,
   signInRefusalBody,
+  steppedBFile,
   synthesizedBFile,
   tooManySearchPage,
 } from '../../fixtures/oeis-upstream.js';
-import { type FetchStep, hangingFetch, res, scriptedFetch } from '../../fixtures/scripted-fetch.js';
+import {
+  type FetchStep,
+  hang,
+  hangingFetch,
+  rangedFile,
+  res,
+  scriptedFetch,
+} from '../../fixtures/scripted-fetch.js';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -634,6 +650,120 @@ describe('OeisService.search', () => {
     });
   });
 
+  describe('rows against the cached record', () => {
+    const params = { q: 'keyword:core', sort: 'modified', start: 0 } as const;
+    /** A search page whose one row is A000045 with the given `%I` timestamp, or no `%I` line. */
+    const pageEditedAt = (time: string | undefined) =>
+      res(
+        searchPageText({
+          query: 'keyword:core',
+          status: 'Showing 1-1 of 1',
+          records: [
+            capturedSearchRecords.A000045.replace(
+              '%I A000045 M0692 N0256 #2594 Sep 23 2026 16:08:09',
+              time === undefined ? '' : `%I A000045 M0692 N0256 #2595 ${time}`,
+            ),
+          ],
+        }),
+        { status: 200 },
+      );
+    const newerRecord = recordWith({ revision: 903, time: '2026-10-01T18:00:00-04:00' });
+
+    it('makes the next record read revalidate when a row shows a later edit, with no request at search time', async () => {
+      const h = harness([
+        json(),
+        pageEditedAt('Oct 01 2026 18:00:00'),
+        json(newerRecord, { 'last-modified': 'Thu, 01 Oct 2026 22:00:00 GMT' }),
+      ]);
+      await h.service.getRecord('A000045', h.ctx);
+      const page = await h.service.search(params, ctx);
+      expect(page.rows[0]?.modified).toBe('2026-10-01T18:00:00-04:00');
+      expect(h.fetchCalls).toHaveLength(2);
+      expect(h.service.getCachedRecord('A000045')).toBeUndefined();
+
+      const record = await h.service.getRecord('A000045', h.ctx);
+      expect(h.fetchCalls).toHaveLength(3);
+      expect(h.fetchCalls[2]?.url).toBe(RECORD_URL);
+      expect(h.fetchCalls[2]?.headers.get('if-modified-since')).toBe(FIBONACCI_LAST_MODIFIED);
+      expect(record).toMatchObject({ revision: 903, modified: '2026-10-01T18:00:00-04:00' });
+
+      await h.service.getRecord('A000045', h.ctx);
+      expect(h.fetchCalls).toHaveLength(3);
+    });
+
+    it.each([
+      ['the same edit time', 'Sep 23 2026 16:08:09'],
+      ['an earlier edit time', 'Sep 20 2026 09:00:00'],
+      ['no %I line', undefined],
+    ])('keeps serving the cached record for a row with %s', async (_shape, time) => {
+      const h = harness([json(), pageEditedAt(time)]);
+      const first = await h.service.getRecord('A000045', h.ctx);
+      await h.service.search(params, ctx);
+      expect(await h.service.getRecord('A000045', h.ctx)).toBe(first);
+      expect(h.fetchCalls).toHaveLength(2);
+    });
+
+    it('keeps serving a cached record that has no edit time, whatever the row shows', async () => {
+      const h = harness([
+        json(recordWith({ time: undefined })),
+        pageEditedAt('Oct 01 2026 18:00:00'),
+      ]);
+      const first = await h.service.getRecord('A000045', h.ctx);
+      expect(first?.modified).toBeUndefined();
+      await h.service.search(params, ctx);
+      expect(await h.service.getRecord('A000045', h.ctx)).toBe(first);
+      expect(h.fetchCalls).toHaveLength(2);
+    });
+
+    it('compares instants: a fall-back-hour row at 01:40 -04:00 is earlier than a record at 01:30 -05:00', async () => {
+      const h = harness([
+        json(recordWith({ time: '2026-11-01T01:30:00-05:00' })),
+        pageEditedAt('Nov 01 2026 01:40:00'),
+      ]);
+      const first = await h.service.getRecord('A000045', h.ctx);
+      const page = await h.service.search(params, ctx);
+      expect(page.rows[0]?.modified).toBe('2026-11-01T01:40:00-04:00');
+      expect(await h.service.getRecord('A000045', h.ctx)).toBe(first);
+      expect(h.fetchCalls).toHaveLength(2);
+    });
+
+    it('does not mark the record again from a search page served from cache', async () => {
+      const h = harness([json(), pageEditedAt('Oct 01 2026 18:00:00'), res(null, { status: 304 })]);
+      await h.service.getRecord('A000045', h.ctx);
+      await h.service.search(params, ctx);
+      // The revalidation answers 304, so the record stays older than the cached page's row.
+      await h.service.getRecord('A000045', h.ctx);
+      expect(h.fetchCalls).toHaveLength(3);
+
+      await h.service.search(params, ctx);
+      await h.service.getRecord('A000045', h.ctx);
+      expect(h.fetchCalls).toHaveLength(3);
+    });
+
+    it('marks nothing and requests nothing more when no record is cached', async () => {
+      const h = harness([pageEditedAt('Oct 01 2026 18:00:00'), json()]);
+      await h.service.search(params, ctx);
+      expect(h.service.getCachedRecord('A000045')).toBeUndefined();
+      await h.service.getRecord('A000045', h.ctx);
+      expect(h.fetchCalls).toHaveLength(2);
+      expect(h.fetchCalls[1]?.headers.has('if-modified-since')).toBe(false);
+    });
+
+    it.each([
+      ['an edit time', 'Oct 01 2026 18:00:00'],
+      ['no %I line', undefined],
+    ])(
+      'forgets a remembered 404 once a row with %s shows the entry exists',
+      async (_shape, time) => {
+        const h = harness([res('gone', { status: 404 }), pageEditedAt(time), json()]);
+        expect(await h.service.getRecord('A000045', h.ctx)).toBeUndefined();
+        await h.service.search(params, ctx);
+        expect(await h.service.getRecord('A000045', h.ctx)).toMatchObject({ aNumber: 'A000045' });
+        expect(h.fetchCalls).toHaveLength(3);
+      },
+    );
+  });
+
   describe('403 split', () => {
     const params = { q: 'keyword:core', sort: 'relevance', start: 100 } as const;
 
@@ -766,6 +896,7 @@ describe('OeisService.getBFile', () => {
     await h.service.getBFile('A000045', ctx);
     expect(h.fetchCalls[0]?.url).toBe(BFILE_URL);
     expect(h.fetchCalls[0]?.headers.get('range')).toBe('bytes=0-1048575');
+    expect(h.fetchCalls[0]?.headers.get('if-range')).toBeNull();
     expect(h.fetchCalls[0]?.init.redirect).toBe('manual');
   });
 
@@ -1006,6 +1137,512 @@ describe('OeisService.getBFile', () => {
       });
       expect(h.fetchCalls).toHaveLength(2);
     });
+  });
+});
+
+describe('OeisService.getBFile past the first 1 MiB', () => {
+  const SIGMA_URL = 'https://oeis.org/A000203/b000203.txt';
+  const PAGE0_LAST = 87_084;
+  const sigma = () => rangedFile({ body: sigmaBFile(), etag: SIGMA_ETAG });
+  const ok = (read: Awaited<ReturnType<OeisService['getBFile']>>) => {
+    if (read.status !== 'ok') throw new Error('expected an ok read');
+    return read;
+  };
+  /** Every pair of a read is the file's own line: sigma(n) at n, n consecutive. */
+  const expectSigmaRun = (pairs: readonly { n: number; value: string }[]) => {
+    expect(pairs.length).toBeGreaterThan(0);
+    pairs.forEach((pair, i) => {
+      expect(pair).toEqual({ n: (pairs[0]?.n ?? 0) + i, value: sigmaOf(pair.n) });
+    });
+  };
+
+  it('reads the page holding fromIndex with Range and If-Range, and reports the true last index', async () => {
+    const h = harness([sigma().step]);
+    const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+    expect(h.fetchCalls).toHaveLength(2);
+    expect(h.fetchCalls[1]?.url).toBe(SIGMA_URL);
+    expect(h.fetchCalls[1]?.headers.get('range')).toBe('bytes=1044480-1214181');
+    expect(h.fetchCalls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+    expect(h.fetchCalls[1]?.init.redirect).toBe('manual');
+    expect(read).toMatchObject({
+      cut: false,
+      firstIndex: 1,
+      lastIndex: 100_000,
+      sizeInBytes: 1_214_182,
+    });
+    expect(read).not.toHaveProperty('nextIndex');
+    expect(read.terms[0]?.n).toBe(86_765);
+    expect(read.terms.at(-1)).toEqual({ n: 100_000, value: '246078' });
+    expectSigmaRun(read.terms);
+  });
+
+  it('makes no request past the first 1 MiB for a fromIndex inside it, and offers the next index', async () => {
+    const h = harness([sigma().step]);
+    for (const fromIndex of [undefined, 1, PAGE0_LAST]) {
+      const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex }));
+      expect(read).toMatchObject({
+        cut: true,
+        firstIndex: 1,
+        lastIndex: PAGE0_LAST,
+        nextIndex: PAGE0_LAST + 1,
+      });
+      expect(read.terms).toHaveLength(PAGE0_LAST);
+    }
+    expect(h.fetchCalls).toHaveLength(1);
+  });
+
+  it('reports the furthest page read so far when a later call answers from the first page', async () => {
+    const h = harness([sigma().step]);
+    ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+    for (const fromIndex of [undefined, 1, PAGE0_LAST]) {
+      const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex }));
+      expect(read).toMatchObject({
+        cut: false,
+        firstIndex: 1,
+        lastIndex: 100_000,
+        nextIndex: PAGE0_LAST + 1,
+      });
+      expect(read.terms).toHaveLength(PAGE0_LAST);
+    }
+    expect(h.fetchCalls).toHaveLength(2);
+  });
+
+  it("never takes a page's first line for a term, even when its fragment reads as a pair", async () => {
+    const body = `${'#'.repeat(11)}\n${sigmaBFile()}`;
+    // Page 1 starts 4 KiB before 1 MiB, inside the line `86763 115688`.
+    const opening = new TextDecoder().decode(new TextEncoder().encode(body).subarray(1_044_480));
+    expect(opening.slice(0, 12)).toBe('6763 115688\n');
+    const h = harness([rangedFile({ body, etag: '"prefixed"' }).step]);
+    const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+    expect(h.fetchCalls[1]?.headers.get('range')).toBe('bytes=1044480-1214193');
+    expect(read.terms[0]).toEqual({ n: 86_764, value: sigmaOf(86_764) });
+    expect(read.terms.some((pair) => pair.n === 6_763)).toBe(false);
+    expectSigmaRun(read.terms);
+  });
+
+  it('stops after two page reads with unreached, and the next call reads on from the pages cached', async () => {
+    const { body, lastN } = steppedBFile();
+    const h = harness([rangedFile({ body, etag: '"stepped"' }).step]);
+    const target = lastN - 20;
+
+    const first = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: target }));
+    expect(first).toMatchObject({ terms: [], cut: true, unreached: true });
+    expect(first.lastIndex).toBeLessThan(target);
+    expect(first).not.toHaveProperty('nextIndex');
+    expect(h.fetchCalls.map((call) => call.headers.get('range'))).toEqual([
+      'bytes=0-1048575',
+      'bytes=1044480-2097151',
+      'bytes=2093056-3145727',
+    ]);
+
+    const second = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: target }));
+    expect(h.fetchCalls).toHaveLength(4);
+    expect(h.fetchCalls[3]?.headers.get('range')).toBe('bytes=5238784-6291455');
+    expect(second).not.toHaveProperty('unreached');
+    expect(second.terms.find((pair) => pair.n === target)).toEqual({
+      n: target,
+      value: '9'.repeat(990),
+    });
+    const start = second.terms[0]?.n ?? Number.NaN;
+    expect(second.terms.map((pair) => pair.n)).toEqual(second.terms.map((_, i) => start + i));
+  });
+
+  it('skips a line longer than the overlap that neither page holds whole, and starts at the next n', async () => {
+    const { body, longN } = longLineBFile();
+    const h = harness([rangedFile({ body, etag: '"long"' }).step]);
+
+    const read = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: longN }));
+    expect(read).toMatchObject({ skippedLine: true, cut: false });
+    expect(read.terms[0]).toEqual({ n: longN + 1, value: String((longN + 1) * 3) });
+    expect(h.fetchCalls).toHaveLength(2);
+
+    const before = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: longN - 1 }));
+    expect(before.terms.at(-1)).toEqual({ n: longN - 1, value: String((longN - 1) * 3) });
+    const after = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: longN + 1 }));
+    for (const held of [before, after]) expect(held).not.toHaveProperty('skippedLine');
+    expect(h.fetchCalls).toHaveLength(2);
+  });
+
+  it('knows the file ends when its final page holds only pairs the page before already has', async () => {
+    const line = (n: number) => `${n} ${String(n).padStart(9, '0')}\n`;
+    let body = '';
+    let last = 0;
+    while (body.length + line(last + 1).length <= 2 * 1_048_576 - 3) body += line(++last);
+    // Blank lines run from just before 2 MiB past it, so the final page adds no pair.
+    body += '\n'.repeat(2 * 1_048_576 - body.length + 5);
+    const h = harness([rangedFile({ body, etag: '"trailing"' }).step]);
+    await h.service.getBFile('A000001', h.ctx, { fromIndex: last - 2 });
+    const past = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: last + 1 }));
+    expect(past).toMatchObject({ lastIndex: last, cut: false });
+    expect(past).not.toHaveProperty('unreached');
+    expect(h.fetchCalls).toHaveLength(3);
+  });
+
+  it('returns missing when the file is gone by the time a page is requested, and caches that', async () => {
+    const h = harness([sigma().step, res('<html>Not found</html>', { status: 404 })]);
+    await expect(h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 })).resolves.toEqual({
+      status: 'missing',
+    });
+    await expect(h.service.getBFile('A000203', h.ctx)).resolves.toEqual({ status: 'missing' });
+    expect(h.fetchCalls).toHaveLength(2);
+    expect(h.fetchCalls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+  });
+
+  /** A response from a {@link rangedFile} step with its headers edited. */
+  const reheadered =
+    (edit: (headers: Headers) => void): FetchStep =>
+    (call) => {
+      const answer = sigma().step(call);
+      const headers = new Headers(answer.headers);
+      edit(headers);
+      return new Response(answer.body, { status: answer.status, headers });
+    };
+
+  it.each([
+    ['no ETag', reheadered((headers) => headers.delete('etag'))],
+    ['a weak ETag', reheadered((headers) => headers.set('etag', `W/${SIGMA_ETAG}`))],
+    [
+      'a 200 without Accept-Ranges',
+      res(sigmaBFile(), {
+        status: 200,
+        headers: { etag: SIGMA_ETAG, 'content-length': String(sigmaBFile().length) },
+      }),
+    ],
+  ])(
+    'reads only the first 1 MiB of a file served with %s, in one request',
+    async (_label, step) => {
+      const h = harness([step]);
+      const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+      expect(read).toMatchObject({
+        cut: true,
+        firstMibOnly: true,
+        lastIndex: PAGE0_LAST,
+        sizeInBytes: 1_214_182,
+      });
+      expect(read).not.toHaveProperty('nextIndex');
+      expect(read).not.toHaveProperty('unreached');
+      expect(read.terms).toHaveLength(PAGE0_LAST);
+      expect(h.fetchCalls).toHaveLength(1);
+    },
+  );
+
+  describe('a three-page file', () => {
+    const lucas = () => rangedFile({ body: lucasBFile(), etag: LUCAS_ETAG });
+    const lucasPairs = () =>
+      lucasBFile()
+        .split('\n')
+        .map((line) => {
+          const [n, value] = line.split(' ');
+          return { n: Number(n), value };
+        });
+
+    it('walks every page with nextIndex, n consecutive across both joins', async () => {
+      const h = harness([lucas().step]);
+      const seen: { n: number; value: string | undefined }[] = [];
+      let fromIndex: number | undefined;
+      for (let call = 0; call < 5; call++) {
+        const read = ok(await h.service.getBFile('A000032', h.ctx, { fromIndex }));
+        const from = fromIndex;
+        seen.push(...read.terms.filter((pair) => from === undefined || pair.n >= from));
+        fromIndex = read.nextIndex;
+        if (fromIndex === undefined) break;
+      }
+      expect(fromIndex).toBeUndefined();
+      expect(seen).toEqual(lucasPairs());
+      expect(h.fetchCalls.map((call) => call.headers.get('range'))).toEqual([
+        'bytes=0-1048575',
+        'bytes=1044480-2097151',
+        'bytes=2093056-2412956',
+      ]);
+    });
+
+    // Each target starts cold, so every one reads the first page again: about 100 targets, 3 s.
+    it('reaches fromIndex values across both later pages with at most two page reads each', {
+      timeout: 30_000,
+    }, async () => {
+      const pairs = lucasPairs();
+      const file = lucas();
+      const targets = [4_449, 4_450, 4_775];
+      for (let n = 3_138; n <= 4_775; n += 16) targets.push(n);
+      const pageReads = new Map<number, number>();
+      for (const n of targets) {
+        const h = harness([file.step]);
+        const read = ok(await h.service.getBFile('A000032', h.ctx, { fromIndex: n }));
+        expect(read.terms.find((pair) => pair.n === n)).toEqual(pairs[n]);
+        const reads = h.fetchCalls.length - 1;
+        pageReads.set(reads, (pageReads.get(reads) ?? 0) + 1);
+      }
+      expect([...pageReads.keys()].sort((x, y) => x - y)).toEqual([1, 2]);
+    });
+  });
+
+  describe('ETag-keyed pages', () => {
+    const SIGMA_V2_ETAG = '"sigma-v2"';
+    /** The next version of A000203's b-file: every value with a 0 appended. */
+    const sigmaV2 = () => sigmaBFile().replace(/^\d+ \d+$/gm, (line) => `${line}0`);
+    const expectSigmaV2Run = (pairs: readonly { n: number; value: string }[]) => {
+      expect(pairs.length).toBeGreaterThan(0);
+      pairs.forEach((pair, i) => {
+        expect(pair).toEqual({ n: (pairs[0]?.n ?? 0) + i, value: `${sigmaOf(pair.n)}0` });
+      });
+    };
+
+    /** Reads page 0 at the start, page 1 a day later, then lets 6 more days pass: page 0 is stale. */
+    async function cachedThenStale(h: Harness) {
+      await h.service.getBFile('A000203', h.ctx);
+      h.clock.now += DAY;
+      await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 });
+      h.clock.now += 6 * DAY;
+    }
+
+    it('reads a later page again under the new ETag once the first page is re-read for a changed file', async () => {
+      const file = sigma();
+      const h = harness([file.step]);
+      await cachedThenStale(h);
+      file.state.version = { body: sigmaV2(), etag: SIGMA_V2_ETAG };
+
+      const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+      expect(h.fetchCalls.map((call) => call.headers.get('if-range'))).toEqual([
+        null,
+        SIGMA_ETAG,
+        null,
+        SIGMA_V2_ETAG,
+      ]);
+      expect(read).toMatchObject({ lastIndex: 100_000, sizeInBytes: 1_314_182, cut: false });
+      expectSigmaV2Run(read.terms);
+    });
+
+    it('reuses a cached later page when the re-read first page carries the same ETag', async () => {
+      const h = harness([sigma().step]);
+      await cachedThenStale(h);
+      const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+      expect(h.fetchCalls).toHaveLength(3);
+      expect(h.fetchCalls[2]?.headers.get('range')).toBe('bytes=0-1048575');
+      expect(read.terms.at(-1)).toEqual({ n: 100_000, value: '246078' });
+      expectSigmaRun(read.terms);
+    });
+
+    it('starts over from the new first page when a page request finds the file changed', async () => {
+      const file = sigma();
+      const h = harness([
+        file.step,
+        (call) => {
+          file.state.version = { body: sigmaV2(), etag: SIGMA_V2_ETAG };
+          return file.step(call);
+        },
+        file.step,
+      ]);
+      const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+      expect(h.fetchCalls.map((call) => call.headers.get('if-range'))).toEqual([
+        null,
+        SIGMA_ETAG,
+        SIGMA_V2_ETAG,
+      ]);
+      expect(h.fetchCalls[2]?.headers.get('range')).toBe('bytes=1044480-1314181');
+      expect(read).toMatchObject({ lastIndex: 100_000, sizeInBytes: 1_314_182, cut: false });
+      expectSigmaV2Run(read.terms);
+
+      const head = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 1 }));
+      expectSigmaV2Run(head.terms);
+      expect(h.fetchCalls).toHaveLength(3);
+    });
+  });
+
+  describe('page request failures', () => {
+    it('fails a page request answered 429 as upstream_rate_limited, with its Retry-After', async () => {
+      const h = harness([
+        sigma().step,
+        res('slow down', { status: 429, headers: { 'retry-after': '120' } }),
+      ]);
+      const error = await caught(h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data).toMatchObject({ reason: 'upstream_rate_limited', retryAfter: '120' });
+      expect(h.fetchCalls).toHaveLength(2);
+      expect(h.fetchCalls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+    });
+
+    it.each([
+      [
+        'another range',
+        (headers: Headers) => headers.set('content-range', 'bytes 1040384-1210085/1214182'),
+      ],
+      ['another ETag', (headers: Headers) => headers.set('etag', '"sigma-v2"')],
+    ])(
+      'rejects a 206 page from %s without retrying, and reads the first page again on the next call',
+      async (_label, edit) => {
+        const h = harness([sigma().step, reheadered(edit), sigma().step]);
+        const error = await caught(h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data).toMatchObject({ reason: 'upstream_unparseable', retryable: false });
+        expect(h.fetchCalls).toHaveLength(2);
+
+        const read = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+        expect(h.fetchCalls.map((call) => call.headers.get('range'))).toEqual([
+          'bytes=0-1048575',
+          'bytes=1044480-1214181',
+          'bytes=0-1048575',
+          'bytes=1044480-1214181',
+        ]);
+        expect(read.terms.at(-1)).toEqual({ n: 100_000, value: '246078' });
+        expectSigmaRun(read.terms);
+      },
+    );
+
+    it('sheds a page request the queue cannot start in time, after the first page', async () => {
+      const pacer = createPacer({ name: 'oeis-test', minStartGapMs: 10_000, maxConcurrent: 1 });
+      try {
+        const { calls, fetch } = scriptedFetch(sigma().step);
+        const service = new OeisService({ fetch, pacer, queueMaxWaitMs: 1_000 });
+        const error = await caught(
+          service.getBFile('A000203', createMockContext(), { fromIndex: 99_990 }),
+        );
+        expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+        expect(error.data).toMatchObject({ reason: 'pacer_shed', shedKind: 'wait_projected' });
+        expect(error.data?.retryAfter).toBeDefined();
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.headers.get('if-range')).toBeNull();
+      } finally {
+        pacer.dispose();
+      }
+    });
+
+    it('rethrows a caller abort during a page request, caches nothing from it, and lets a concurrent call finish', async () => {
+      const file = sigma();
+      const aStarted = Promise.withResolvers<void>();
+      const bStarted = Promise.withResolvers<void>();
+      const bGate = Promise.withResolvers<void>();
+      const h = harness([
+        file.step,
+        (call) => {
+          aStarted.resolve();
+          return hang(call.init.signal);
+        },
+        async (call) => {
+          bStarted.resolve();
+          await bGate.promise;
+          return file.step(call);
+        },
+        file.step,
+      ]);
+      const controller = new AbortController();
+      const a = h.service
+        .getBFile('A000203', createMockContext({ signal: controller.signal }), {
+          fromIndex: 99_990,
+        })
+        .then(
+          () => ({ error: undefined }),
+          (error: unknown) => ({ error }),
+        );
+      await aStarted.promise;
+      const b = h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 });
+      await bStarted.promise;
+
+      const reason = new Error('client went away');
+      controller.abort(reason);
+      const { error } = await a;
+      expect(error).toBe(reason);
+      expect(error).not.toBeInstanceOf(McpError);
+
+      const after = ok(await h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 }));
+      expect(h.fetchCalls).toHaveLength(4);
+      expectSigmaRun(after.terms);
+
+      bGate.resolve();
+      const concurrent = ok(await b);
+      expect(concurrent.terms.at(-1)).toEqual({ n: 100_000, value: '246078' });
+      expectSigmaRun(concurrent.terms);
+      expect(h.fetchCalls.slice(1).map((call) => call.headers.get('if-range'))).toEqual([
+        SIGMA_ETAG,
+        SIGMA_ETAG,
+        SIGMA_ETAG,
+      ]);
+    });
+
+    describe('retried', () => {
+      beforeEach(() => {
+        vi.useFakeTimers();
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it.each([
+        ['short', -100],
+        ['long', 100],
+      ])(
+        'fails a 206 page body 100 bytes too %s as upstream_unparseable after three attempts',
+        async (_label, delta) => {
+          const file = sigma();
+          const misSized: FetchStep = async (call) => {
+            const answer = file.step(call);
+            const bytes = new Uint8Array(await answer.arrayBuffer());
+            const body = new Uint8Array(bytes.length + delta);
+            body.set(bytes.subarray(0, Math.min(bytes.length, body.length)));
+            return new Response(body, { status: answer.status, headers: answer.headers });
+          };
+          const h = harness([file.step, misSized]);
+          const error = await caught(
+            withBackoff(h.service.getBFile('A000203', h.ctx, { fromIndex: 99_990 })),
+          );
+          expect(error).toMatchObject({
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            data: { reason: 'upstream_unparseable', retryAttempts: 3 },
+          });
+          expect(h.fetchCalls).toHaveLength(4);
+          for (const call of h.fetchCalls.slice(1)) {
+            expect(call.headers.get('range')).toBe('bytes=1044480-1214181');
+            expect(call.headers.get('if-range')).toBe(SIGMA_ETAG);
+          }
+        },
+      );
+    });
+  });
+
+  it('parses a page in time linear in its size', async () => {
+    /** Page 0 holds one pair, then a comment line runs past 1 MiB, so page 1 is mostly the tail. */
+    const head = `0 0\n${'#'.repeat(1_048_576 + 100)}\n`;
+    /** Half newlines, half one digit run that fails the pair pattern at its very end. */
+    const tail = (bytes: number) => `1 1\n${'\n'.repeat(bytes / 2)}2 ${'9'.repeat(bytes / 2)} x`;
+    const sizes = [16_000, 64_000, 256_000, 1_024_000];
+    const SPAN = 64;
+    const SAMPLES = 5;
+    const files = sizes.map((bytes) => rangedFile({ body: head + tail(bytes), etag: '"t"' }));
+    const aNumber = (size: number, sample: number) =>
+      `A${String(1 + size * SAMPLES + sample).padStart(6, '0')}`;
+    const { calls, fetch } = scriptedFetch((call) => {
+      const id = Number(/\/A(\d+)\//.exec(call.url)?.[1]);
+      const file = files[Math.floor((id - 1) / SAMPLES)];
+      if (!file) throw new Error(`no file for ${call.url}`);
+      return file.step(call);
+    });
+    const service = new OeisService({ fetch, pacer: immediatePacer() });
+    const ctx = createMockContext();
+    for (let size = 0; size < sizes.length; size++) {
+      for (let sample = 0; sample < SAMPLES; sample++) {
+        await service.getBFile(aNumber(size, sample), ctx);
+      }
+    }
+    expect(calls).toHaveLength(sizes.length * SAMPLES);
+
+    /** Thread CPU microseconds of each page read, per size; other processes' load stays out. */
+    const spent = sizes.map((): number[] => []);
+    for (let sample = 0; sample < SAMPLES; sample++) {
+      for (let size = 0; size < sizes.length; size++) {
+        const started = process.threadCpuUsage();
+        const read = ok(await service.getBFile(aNumber(size, sample), ctx, { fromIndex: 1 }));
+        const used = process.threadCpuUsage(started);
+        spent[size]?.push(used.user + used.system);
+        expect(read.terms).toEqual([{ n: 1, value: '1' }]);
+      }
+    }
+    expect(calls).toHaveLength(2 * sizes.length * SAMPLES);
+
+    const fastest = spent.map((samples) => Math.min(...samples));
+    const smallest = fastest[0] ?? Number.NaN;
+    const largest = fastest.at(-1) ?? Number.NaN;
+    // Linear growth keeps the ratio at or under SPAN; quadratic growth would put it near SPAN².
+    expect(largest / smallest).toBeLessThan(SPAN * 2);
+    expect(largest).toBeLessThan(1_000_000);
   });
 });
 

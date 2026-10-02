@@ -26,23 +26,43 @@ import { parseSearchText } from './internal-format.js';
 import { heapCharge, LruCache } from './lru-cache.js';
 import { normalizeRecord } from './normalize-record.js';
 import type {
+  BFileOptions,
   BFileRead,
   BFileTerm,
   SearchPage,
   SearchParams,
   SequenceRecord,
+  SequenceSummary,
   UpstreamCallOptions,
 } from './types.js';
+
+type BFileOk = Extract<BFileRead, { status: 'ok' }>;
 
 const ORIGIN = 'https://oeis.org';
 /** One tool call's total budget across attempts, backoffs, and queue wait. */
 export const DEFAULT_DEADLINE_MS = 50_000;
 const PER_ATTEMPT_MS = 15_000;
 const DEFAULT_QUEUE_MAX_WAIT_MS = 30_000;
-const BFILE_MAX_BYTES = 1_048_576;
+/** A b-file is read in pages of this size: bytes 0 to this − 1, then one ranged page at a time. */
+const BFILE_PAGE_BYTES = 1_048_576;
+/**
+ * How far each page past the first starts before the previous page ends, so a line the previous
+ * page cut off is whole in the next. OEIS asks for terms of at most about 1,000 digits; the longest
+ * line measured across five large b-files was 1,004 bytes.
+ */
+const BFILE_OVERLAP_BYTES = 4_096;
+/** Page reads one call may make past the first page. */
+const BFILE_MAX_PAGE_READS = 2;
+/**
+ * Sent on every b-file request. A `200` answering a stale `If-Range` otherwise comes compressed, with
+ * no `Content-Length`, no `Accept-Ranges`, and a weak ETag, so the file's new first page could not
+ * be paged.
+ */
+const UNENCODED = { 'Accept-Encoding': 'identity' } as const;
+const LINE_FEED = 0x0a;
 /** Ceiling on a record body; A000108, among the largest entries, is 134 KB as served. */
 const RECORD_MAX_BYTES = 4 * 1_048_576;
-/** Ceiling on a search page; the heaviest measured page of 10 full records was 264 KB. */
+/** Ceiling on a search page; the heaviest measured page (`keyword:core`) was 517 KB. */
 const SEARCH_MAX_BYTES = 16 * 1_048_576;
 /** Ceiling on a `/search` 403 body; the sign-in refusal is one short line. */
 const REFUSAL_MAX_BYTES = 65_536;
@@ -61,11 +81,36 @@ const SYNTHESIZED_BFILE = /^#\s*A\d{6,7}\s+\(b-file synthesized from sequence en
 const HTML_START = /^\s*<(!doctype\s+html|html[\s>])/i;
 const DEFAULT_USER_AGENT = 'oeis-mcp-server (+https://github.com/cyanheads/oeis-mcp-server)';
 
+/** A b-file's first page as cached: the read it answers with, and what reading later pages takes. */
+interface BFileHead {
+  /**
+   * Present when later pages can be read: the strong ETag each page request is pinned to with
+   * `If-Range`, the file size, and the offset just past the first page's last whole line.
+   */
+  paging?: { endByte: number; etag: string; size: number };
+  read: BFileRead;
+}
+
+/** One page of a b-file: its whole lines and where they sit in the file. */
+interface BFilePage {
+  /** Offset just past the last whole line. */
+  endByte: number;
+  /**
+   * True when the line the page's start cuts runs past the previous page's end, so neither page
+   * holds it whole.
+   */
+  headLost: boolean;
+  /** Offset of the first whole line. */
+  startByte: number;
+  terms: BFileTerm[];
+}
+
 type CachedValue =
   | { kind: 'record'; record: SequenceRecord; lastModified?: string }
   | { kind: 'missing' }
   | { kind: 'search'; page: SearchPage }
-  | { kind: 'bfile'; read: BFileRead };
+  | { kind: 'bfile'; head: BFileHead }
+  | { kind: 'bfile_page'; page: BFilePage };
 
 /** Cached under a record key while OEIS answers `404` for the A-number. */
 const MISSING: CachedValue = { kind: 'missing' };
@@ -179,6 +224,20 @@ function parseRecordBody(text: string): SequenceRecord {
   return normalizeRecord(body);
 }
 
+/** The `n a(n)` pairs of whole b-file lines, in order; any other line is skipped. */
+function parsePairs(text: string): BFileTerm[] {
+  const terms: BFileTerm[] = [];
+  for (const line of text.split('\n')) {
+    const match = BFILE_LINE.exec(line);
+    if (!match) continue;
+    const n = Number(match[1]);
+    if (Number.isSafeInteger(n)) terms.push({ n, value: match[2] ?? '' });
+  }
+  // Each value is a slice of `text`, and a cached slice keeps the whole decoded page alive.
+  return JSON.parse(JSON.stringify(terms)) as BFileTerm[];
+}
+
+/** Pairs of a b-file's first page; a `cut` read drops its trailing partial line. */
 function parseBFile(text: string, cut: boolean): BFileTerm[] {
   if (HTML_START.test(text)) {
     throw serviceUnavailable(
@@ -188,16 +247,132 @@ function parseBFile(text: string, cut: boolean): BFileTerm[] {
       },
     );
   }
-  const lines = text.split('\n');
-  if (cut && !text.endsWith('\n')) lines.pop();
-  const terms: BFileTerm[] = [];
-  for (const line of lines) {
-    const match = BFILE_LINE.exec(line);
-    if (!match) continue;
-    const n = Number(match[1]);
-    if (Number.isSafeInteger(n)) terms.push({ n, value: match[2] ?? '' });
+  return parsePairs(cut ? text.slice(0, text.lastIndexOf('\n') + 1) : text);
+}
+
+/**
+ * Reads a b-file's first page from a `200`, `206`, or `404`. A `200` is read from the stream up to
+ * 1 MiB and then cancelled, so the cap holds either way. Later pages can be read when the file is
+ * larger, its size is stated, it carries a strong ETag, and upstream serves byte ranges.
+ */
+async function readHead(res: Response): Promise<BFileHead> {
+  if (res.status === 404) {
+    await discard(res);
+    return { read: { status: 'missing' } };
   }
-  return terms;
+  const { bytes, overflowed } = await readCapped(res, BFILE_PAGE_BYTES);
+  const text = new TextDecoder().decode(bytes);
+  if (SYNTHESIZED_BFILE.test(text)) return { read: { status: 'missing' } };
+  const sizeInBytes =
+    res.status === 206
+      ? headerInt(res.headers.get('content-range')?.split('/')[1] ?? null)
+      : headerInt(res.headers.get('content-length'));
+  const cut = overflowed || (sizeInBytes !== undefined && sizeInBytes > bytes.length);
+  const terms = parseBFile(text, cut);
+  const first = terms[0];
+  const last = terms.at(-1);
+  const etag = res.headers.get('etag');
+  const ranged =
+    res.status === 206 || res.headers.get('accept-ranges')?.trim().toLowerCase() === 'bytes';
+  const paging =
+    cut && ranged && sizeInBytes !== undefined && etag !== null && !etag.startsWith('W/')
+      ? { endByte: bytes.lastIndexOf(LINE_FEED) + 1, etag, size: sizeInBytes }
+      : undefined;
+  return {
+    read: {
+      status: 'ok',
+      terms,
+      ...(first && { firstIndex: first.n }),
+      ...(last && { lastIndex: last.n }),
+      ...(sizeInBytes !== undefined && { sizeInBytes }),
+      cut,
+      ...(cut && !paging && { firstMibOnly: true }),
+    },
+    ...(paging && { paging }),
+  };
+}
+
+/**
+ * The whole lines of a page read from byte `start`. Its first line is always dropped: a range can
+ * open mid-line, and the overlap makes that line whole in the previous page. A trailing partial line
+ * is dropped too, unless the page ends the file.
+ */
+function parsePage(bytes: Uint8Array, start: number, final: boolean): BFilePage {
+  const firstBreak = bytes.indexOf(LINE_FEED);
+  const from = firstBreak === -1 ? bytes.length : firstBreak + 1;
+  const to = Math.max(from, final ? bytes.length : bytes.lastIndexOf(LINE_FEED) + 1);
+  return {
+    endByte: start + to,
+    headLost: firstBreak === -1 || firstBreak >= BFILE_OVERLAP_BYTES,
+    startByte: start + from,
+    terms: parsePairs(new TextDecoder().decode(bytes.subarray(from, to))),
+  };
+}
+
+/** Cache key of page `index` (≥ 1) of the version of a b-file with this ETag. */
+function pageKey(aNumber: string, index: number, etag: string): string {
+  return `bfile:${aNumber}:${index}:${etag}`;
+}
+
+/**
+ * Where index `n` falls among the known pages: the page holding it, or the nearest pages known to
+ * end before it (`below`) and to start after it (`above`, `lastPage + 1` when none does).
+ */
+function placeAmong(
+  pages: ReadonlyMap<number, BFilePage>,
+  n: number,
+  lastPage: number,
+): { holder: number } | { above: number; below: number } {
+  let below = -1;
+  let above = lastPage + 1;
+  for (const [index, page] of pages) {
+    const first = page.terms[0];
+    const last = page.terms.at(-1);
+    if (!first || !last) continue;
+    if (first.n <= n && n <= last.n) return { holder: index };
+    if (last.n < n) below = Math.max(below, index);
+    else above = Math.min(above, index);
+  }
+  return { above, below };
+}
+
+/**
+ * The page where the line for index `n` is expected to end (a page holds the lines that end in its
+ * own bytes), extrapolated from the end of `page` nearer to `n` at the bytes per index of the tenth
+ * of its pairs on that end.
+ */
+function expectedPage(page: BFilePage, n: number): number {
+  const { terms } = page;
+  const first = terms[0];
+  const last = terms.at(-1);
+  if (!first || !last) return 0;
+  const forward = n > last.n;
+  const k = Math.max(1, Math.floor(terms.length / 10));
+  const run = forward ? terms.slice(-k) : terms.slice(0, k);
+  let bytes = 0;
+  for (const term of run) bytes += String(term.n).length + term.value.length + 2;
+  // The run ends at `last` going forward and starts at `first` going back.
+  const span = forward ? last.n - (run[0] ?? last).n : (run.at(-1) ?? first).n - first.n;
+  const perIndex = bytes / (span + 1);
+  const lineEnd = forward
+    ? page.endByte + (n - last.n) * perIndex
+    : page.startByte - (first.n - n - 1) * perIndex;
+  return Math.floor((lineEnd - 1) / BFILE_PAGE_BYTES);
+}
+
+/** The unread page strictly between `below` and `above` nearest to `estimate`, if any. */
+function pickPage(
+  estimate: number,
+  below: number,
+  above: number,
+  pages: ReadonlyMap<number, BFilePage>,
+): number | undefined {
+  const target = Math.min(above - 1, Math.max(below + 1, estimate));
+  for (let step = 0; target - step > below || target + step < above; step++) {
+    if (target + step < above && !pages.has(target + step)) return target + step;
+    if (target - step > below && !pages.has(target - step)) return target - step;
+  }
+  return;
 }
 
 /** Reads the shared `/search` 403 body: the anonymous paging cap, or an edge refusal. */
@@ -237,7 +412,8 @@ export class OeisService {
   }
 
   /**
-   * The cached record for an A-number while it is younger than 24 h, without any upstream request.
+   * The cached record for an A-number while it is fresh (under 24 h old and not expired by a newer
+   * search row), without any upstream request.
    * A peek: it leaves the entry's place in the LRU order alone.
    */
   getCachedRecord(aNumber: string): SequenceRecord | undefined {
@@ -248,9 +424,11 @@ export class OeisService {
   }
 
   /**
-   * Fetches and normalizes one record. A cached record younger than 24 h is served as-is; an
-   * older one is revalidated with `If-Modified-Since` (a `304` refreshes it without a body). A
-   * `404` is remembered for 1 h, so a repeated missing A-number makes no further request.
+   * Fetches and normalizes one record. A cached record is served as-is for 24 h, or until a fresh
+   * search row shows a later edit (see `search`); after that it is revalidated with
+   * `If-Modified-Since` (a `304` refreshes it without a body). A `404` is remembered for 1 h, or
+   * until a fresh search row lists the entry, so a repeated missing A-number makes no further
+   * request.
    *
    * @returns The record, or `undefined` when OEIS answers `404` for the A-number.
    */
@@ -321,7 +499,11 @@ export class OeisService {
     return fresh.record;
   }
 
-  /** Runs one `/search?fmt=text` query and parses the page. Pages are cached for 1 h. */
+  /**
+   * Runs one `/search?fmt=text` query and parses the page. Pages are cached for 1 h. A freshly
+   * fetched page also expires each cached record or `404` its rows prove outdated (see
+   * `expireOutdatedRecords`).
+   */
   async search(
     params: SearchParams,
     ctx: Context,
@@ -353,62 +535,276 @@ export class OeisService {
       options.deadlineMs,
     );
     this.cache.set(key, { kind: 'search', page }, heapCharge(page), this.now() + SEARCH_TTL_MS);
+    this.expireOutdatedRecords(page.rows);
     return page;
   }
 
   /**
-   * Reads the first 1 MiB of an entry's b-file from its canonical path. Reads are cached for 7 days.
+   * Expires what a page's rows prove outdated, so the next record read asks OEIS again: a
+   * remembered `404` for an entry a row lists, and a record a row shows a later edit for (compared
+   * as instants; that read revalidates with `If-Modified-Since`). Makes no request, and leaves a
+   * record alone when either side has no edit time.
+   */
+  private expireOutdatedRecords(rows: readonly SequenceSummary[]): void {
+    for (const { aNumber, modified } of rows) {
+      const cached = this.cache.peek(`record:${aNumber}`);
+      if (!cached) continue;
+      const { value } = cached;
+      const outdated =
+        value.kind === 'missing' ||
+        (value.kind === 'record' &&
+          modified !== undefined &&
+          value.record.modified !== undefined &&
+          Date.parse(modified) > Date.parse(value.record.modified));
+      if (outdated) cached.expiresAt = this.now();
+    }
+  }
+
+  /**
+   * Reads an entry's b-file from its canonical path. The first page, bytes 0 to 1 MiB − 1, is read on
+   * every call; when `fromIndex` lies past it in a larger file, the page holding it is read as well
+   * (see `locate`). Pages are cached for 7 days: the first under the A-number, a later one under its
+   * index and the first page's ETag, so no page ever answers for another version of the file.
    *
    * @returns `{ status: 'missing' }` when the entry has no b-file: OEIS answers `404`, or `200` with
    *   a file it synthesized from the data line.
    */
-  async getBFile(
-    aNumber: string,
-    ctx: Context,
-    options: UpstreamCallOptions = {},
-  ): Promise<BFileRead> {
-    const key = `bfile:${aNumber}`;
-    const cached = this.cache.get(key);
-    if (cached && cached.value.kind === 'bfile' && cached.expiresAt > this.now()) {
-      ctx.log.debug('OEIS b-file cache hit', { aNumber });
-      return cached.value.read;
-    }
+  async getBFile(aNumber: string, ctx: Context, options: BFileOptions = {}): Promise<BFileRead> {
+    const startedAt = Date.now();
+    const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+    const remainingMs = () => Math.max(0, deadlineMs - (Date.now() - startedAt));
 
-    const read = await this.call<BFileRead>(
-      'getBFile',
-      bFileUrl(aNumber),
-      [200, 206, 404],
-      { Range: `bytes=0-${BFILE_MAX_BYTES - 1}` },
-      async (res) => {
-        if (res.status === 404) {
-          await discard(res);
-          return { status: 'missing' };
-        }
-        const { bytes, overflowed } = await readCapped(res, BFILE_MAX_BYTES);
-        const text = new TextDecoder().decode(bytes);
-        if (SYNTHESIZED_BFILE.test(text)) return { status: 'missing' };
-        const sizeInBytes =
-          res.status === 206
-            ? headerInt(res.headers.get('content-range')?.split('/')[1] ?? null)
-            : headerInt(res.headers.get('content-length'));
-        const cut = overflowed || (sizeInBytes !== undefined && sizeInBytes > bytes.length);
-        return {
-          status: 'ok',
-          terms: parseBFile(text, cut),
-          ...(sizeInBytes !== undefined && { sizeInBytes }),
-          cut,
-        };
-      },
-      ctx,
-      options.deadlineMs,
-    );
-    this.cache.set(key, { kind: 'bfile', read }, heapCharge(read), this.now() + BFILE_TTL_MS);
-    return read;
+    const cached = this.cache.get(`bfile:${aNumber}`);
+    let head: BFileHead;
+    if (cached?.value.kind === 'bfile' && cached.expiresAt > this.now()) {
+      ctx.log.debug('OEIS b-file cache hit', { aNumber });
+      head = cached.value.head;
+    } else {
+      head = await this.call(
+        'getBFile',
+        bFileUrl(aNumber),
+        [200, 206, 404],
+        { ...UNENCODED, Range: `bytes=0-${BFILE_PAGE_BYTES - 1}` },
+        readHead,
+        ctx,
+        remainingMs(),
+      );
+      this.cacheHead(aNumber, head);
+    }
+    return this.locate(aNumber, head, options.fromIndex, ctx, remainingMs);
   }
 
   /** Releases the pacer: clears its timer and rejects queued waiters. */
   dispose(): void {
     this.pacer.dispose();
+  }
+
+  private cacheHead(aNumber: string, head: BFileHead): void {
+    this.cache.set(
+      `bfile:${aNumber}`,
+      { kind: 'bfile', head },
+      heapCharge(head),
+      this.now() + BFILE_TTL_MS,
+    );
+  }
+
+  /**
+   * Answers `fromIndex` (the first page when it is unset) from the page of a b-file that holds it. A
+   * `200` to a page request means the file changed: its first page replaced the cached one, and the
+   * search restarts from it with the reads left, so one answer never mixes two versions of a file.
+   */
+  private async locate(
+    aNumber: string,
+    head: BFileHead,
+    fromIndex: number | undefined,
+    ctx: Context,
+    remainingMs: () => number,
+  ): Promise<BFileRead> {
+    const budget = { reads: 0 };
+    let current = head;
+    while (true) {
+      const step = await this.searchPages(aNumber, current, fromIndex, budget, ctx, remainingMs);
+      if ('answer' in step) return step.answer;
+      current = step.changed;
+    }
+  }
+
+  /**
+   * Finds the page holding `fromIndex` among the pages known for this version of the file (the
+   * first page and any cached ones), reading more until one holds it, the file is known to end
+   * before it, or the call's page reads are spent. Each read is picked by extrapolating bytes per
+   * index from the page just read (at first, the furthest known page below `fromIndex`), kept
+   * strictly between the nearest pages known to end before and to start after it. When `fromIndex`
+   * falls between two pages with no unread page between them (a gap in the file's indices, a
+   * skipped long line, or pages holding no pairs), the answer starts at the later page's first pair,
+   * or reports the file's end when no later page holds one. An unset `fromIndex`, or one inside the
+   * first page, is answered from the first page; `lastIndex` and `cut` still describe every page
+   * known.
+   */
+  private async searchPages(
+    aNumber: string,
+    head: BFileHead,
+    fromIndex: number | undefined,
+    budget: { reads: number },
+    ctx: Context,
+    remainingMs: () => number,
+  ): Promise<{ answer: BFileRead } | { changed: BFileHead }> {
+    const { read, paging } = head;
+    if (read.status !== 'ok' || !paging) return { answer: read };
+    const lastPage = Math.floor((paging.size - 1) / BFILE_PAGE_BYTES);
+    const pages = new Map<number, BFilePage>([
+      [
+        0,
+        {
+          endByte: paging.endByte,
+          headLost: false,
+          startByte: 0,
+          terms: read.terms,
+        },
+      ],
+    ]);
+    for (let index = 1; index <= lastPage; index++) {
+      const cached = this.cache.peek(pageKey(aNumber, index, paging.etag));
+      if (cached?.value.kind === 'bfile_page' && cached.expiresAt > this.now()) {
+        pages.set(index, cached.value.page);
+      }
+    }
+    const answer = (served?: number, skippedLine = false) => ({
+      answer: this.pageRead(aNumber, read, paging, pages, served, skippedLine),
+    });
+    if (read.lastIndex === undefined || fromIndex === undefined || fromIndex <= read.lastIndex) {
+      return answer(0);
+    }
+
+    let justRead: BFilePage | undefined;
+    while (true) {
+      const place = placeAmong(pages, fromIndex, lastPage);
+      if ('holder' in place) return answer(place.holder);
+      const { above, below } = place;
+      let unread = false;
+      for (let index = below + 1; index < above && !unread; index++) unread = !pages.has(index);
+      // Every page between holds no pairs: the file ends, or its indices skip, before fromIndex.
+      if (!unread) {
+        return above > lastPage
+          ? answer(below)
+          : answer(above, pages.get(above)?.headLost === true);
+      }
+      const source = justRead?.terms.length ? justRead : pages.get(below);
+      const pick =
+        source && budget.reads < BFILE_MAX_PAGE_READS
+          ? pickPage(expectedPage(source, fromIndex), below, above, pages)
+          : undefined;
+      if (pick === undefined) return answer();
+      budget.reads++;
+      const page = await this.readPage(aNumber, paging, pick, ctx, remainingMs());
+      if ('read' in page) return { changed: page };
+      pages.set(pick, page);
+      justRead = page;
+    }
+  }
+
+  /**
+   * The read answering from known page `served`, or with no pairs when `fromIndex` was not reached.
+   * `lastIndex` is the highest n of any known page, and `cut` holds while a page after the last one
+   * holding pairs is unread, so a final page whose pairs all lie in the overlap, or that holds none,
+   * still ends the file.
+   */
+  private pageRead(
+    aNumber: string,
+    first: BFileOk,
+    paging: NonNullable<BFileHead['paging']>,
+    pages: ReadonlyMap<number, BFilePage>,
+    served: number | undefined,
+    skippedLine: boolean,
+  ): BFileRead {
+    let lastIndex: number | undefined;
+    let reachedPage = -1;
+    for (const [index, page] of pages) {
+      const n = page.terms.at(-1)?.n;
+      if (n === undefined) continue;
+      lastIndex = Math.max(lastIndex ?? n, n);
+      reachedPage = Math.max(reachedPage, index);
+    }
+    const lastPage = Math.floor((paging.size - 1) / BFILE_PAGE_BYTES);
+    let cut = false;
+    for (let index = reachedPage + 1; index <= lastPage && !cut; index++) cut = !pages.has(index);
+    const page = served === undefined ? undefined : pages.get(served);
+    // Mark the served page recently used; the pages were gathered with peek.
+    if (served !== undefined && served > 0) this.cache.get(pageKey(aNumber, served, paging.etag));
+    const last = page?.terms.at(-1);
+    return {
+      status: 'ok',
+      terms: page?.terms ?? [],
+      ...(first.firstIndex !== undefined && { firstIndex: first.firstIndex }),
+      ...(lastIndex !== undefined && { lastIndex }),
+      ...(last && (cut || last.n !== lastIndex) && { nextIndex: last.n + 1 }),
+      sizeInBytes: paging.size,
+      cut,
+      ...(skippedLine && { skippedLine: true }),
+      ...(page === undefined && { unreached: true }),
+    };
+  }
+
+  /**
+   * Reads page `index` (≥ 1) of a b-file by byte range, from 4 KiB before the page's own first byte
+   * to its last, clipped to the file, and pinned to the first page's ETag with `If-Range`. A `206`
+   * is the page, cached for 7 days under its index and that ETag. A `200` (the ETag no longer
+   * matches: the file changed) or a `404` (it was removed) is read as the file's new first page,
+   * which replaces the cached one.
+   */
+  private async readPage(
+    aNumber: string,
+    paging: NonNullable<BFileHead['paging']>,
+    index: number,
+    ctx: Context,
+    deadlineMs: number,
+  ): Promise<BFilePage | BFileHead> {
+    const start = index * BFILE_PAGE_BYTES - BFILE_OVERLAP_BYTES;
+    const end = Math.min((index + 1) * BFILE_PAGE_BYTES, paging.size) - 1;
+    const page = await this.call<BFilePage | BFileHead>(
+      'getBFilePage',
+      bFileUrl(aNumber),
+      [200, 206, 404],
+      { ...UNENCODED, Range: `bytes=${start}-${end}`, 'If-Range': paging.etag },
+      async (res) => {
+        if (res.status !== 206) return readHead(res);
+        const etag = res.headers.get('etag');
+        if (
+          res.headers.get('content-range')?.trim() !== `bytes ${start}-${end}/${paging.size}` ||
+          (etag !== null && etag !== paging.etag)
+        ) {
+          // Not this page of the version page 0 came from: read page 0 again on the next call.
+          await discard(res);
+          this.cache.delete(`bfile:${aNumber}`);
+          throw serviceUnavailable(
+            'OEIS answered a b-file range request from another range or version of the file.',
+            { reason: 'upstream_unparseable', retryable: false },
+          );
+        }
+        const length = end - start + 1;
+        const { bytes, overflowed } = await readCapped(res, length);
+        if (overflowed || bytes.length !== length) {
+          throw serviceUnavailable(
+            'OEIS answered a b-file range request with a body of the wrong length.',
+            { reason: 'upstream_unparseable' },
+          );
+        }
+        return parsePage(bytes, start, end === paging.size - 1);
+      },
+      ctx,
+      deadlineMs,
+    );
+    if ('read' in page) {
+      this.cacheHead(aNumber, page);
+    } else {
+      this.cache.set(
+        pageKey(aNumber, index, paging.etag),
+        { kind: 'bfile_page', page },
+        heapCharge(page),
+        this.now() + BFILE_TTL_MS,
+      );
+    }
+    return page;
   }
 
   /**

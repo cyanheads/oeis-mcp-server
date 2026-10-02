@@ -1,10 +1,12 @@
 /**
  * @fileoverview Tests for oeis_get_terms through the tool contract over a real OeisService with a
  * scripted fetch: A-number, fromIndex, and limit input with blank form-client values; the b-file
- * request (206 paging, a 200 cut at 1 MiB), the data-line fallback on a missing b-file, the
- * cached-record routes that skip the b-file request, the sequence_not_found and pacer_shed contracts,
- * slicing and nextFromIndex, every notice, required enrichment on the zero-result and under-cap
- * pages, upstream failure classes, and `format()` parity with `structuredContent`.
+ * request (a whole 206, a b-file served without ranges and cut at 1 MiB), ranged pages past the
+ * first 1 MiB (If-Range, joins, the unreached and skipped-line notices, failures on a page
+ * request), the data-line fallback on a missing b-file, the cached-record routes that skip the
+ * b-file request, the sequence_not_found, pacer_shed, and upstream_rate_limited contracts, slicing
+ * and nextFromIndex, every notice, required enrichment on the zero-result and under-cap pages,
+ * upstream failure classes, and `format()` parity with `structuredContent`.
  * @module tests/tools/oeis-get-terms.tool.test
  */
 
@@ -19,15 +21,21 @@ import {
   fibonacciBFile,
   fibonacciRecordJson,
   htmlMaintenanceBody,
+  longLineBFile,
   minimalRecordJson,
   oversizedBFile,
   type RawRecord,
   recordBody,
   recordWith,
   reservedRecordJson,
+  SIGMA_ETAG,
+  sigmaBFile,
+  sigmaOf,
+  steppedBFile,
   synthesizedBFile,
+  trailingCommentsBFile,
 } from '../fixtures/oeis-upstream.js';
-import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
+import { hang, rangedFile, res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, immediatePacer, serviceOver, withBackoff } from '../fixtures/tool-service.js';
 
 const holder = vi.hoisted(() => ({ service: undefined as unknown }));
@@ -40,6 +48,7 @@ type Result = Awaited<ReturnType<typeof runToolContract>>;
 type Term = { n: number; value: string };
 
 const FIB_BFILE_URL = 'https://oeis.org/A000045/b000045.txt';
+const SIGMA_BFILE_URL = 'https://oeis.org/A000203/b000203.txt';
 const ONE_MIB = 1_048_576;
 
 const record = (raw: RawRecord = fibonacciRecordJson) =>
@@ -172,6 +181,7 @@ describe('oeis_get_terms', () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]?.url).toBe(FIB_BFILE_URL);
       expect(calls[0]?.headers.get('range')).toBe(`bytes=0-${ONE_MIB - 1}`);
+      expect(calls[0]?.headers.get('if-range')).toBeNull();
       expect(calls[0]?.init.redirect).toBe('manual');
     });
 
@@ -347,18 +357,62 @@ describe('oeis_get_terms', () => {
       );
     });
 
-    it('reaches the last term read from a cut b-file and says nothing follows in this read', async () => {
+    it('reaches the last whole term of the first 1 MiB and continues past it with nextFromIndex', async () => {
       const { text } = oversizedBFile();
       const head = text.slice(0, ONE_MIB).split('\n');
       head.pop();
       const lastFullN = head.length - 1;
-      const { result } = await getTerms(
+      const { calls, result } = await getTerms(
+        { aNumber: 'A000045', fromIndex: lastFullN - 1, limit: 1000 },
+        rangedFile({ body: text, etag: '"v1"' }).step,
+      );
+      expect(ns(result)).toEqual([lastFullN - 1, lastFullN]);
+      expect(structured(result)).toMatchObject({
+        bFileCut: true,
+        lastAvailableIndex: lastFullN,
+        nextFromIndex: lastFullN + 1,
+        truncated: true,
+        shown: 2,
+      });
+      expect(structured(result).notice).toBe(
+        `More terms follow; call again with fromIndex ${lastFullN + 1}.`,
+      );
+      expect(calls).toHaveLength(1);
+    });
+
+    it('stops at the first 1 MiB of a b-file served without ranges, and points at its URL', async () => {
+      const { text } = oversizedBFile();
+      const head = text.slice(0, ONE_MIB).split('\n');
+      head.pop();
+      const lastFullN = head.length - 1;
+      const { calls, result } = await getTerms(
         { aNumber: 'A000045', fromIndex: lastFullN - 1, limit: 1000 },
         bFile(text),
       );
       expect(ns(result)).toEqual([lastFullN - 1, lastFullN]);
       expect(structured(result)).toMatchObject({ bFileCut: true, truncated: false, shown: 2 });
       expect(structured(result)).not.toHaveProperty('nextFromIndex');
+      expect(structured(result).notice).toBe(
+        `Only the first 1 MiB of the b-file was read; terms past n = ${lastFullN} are at ${FIB_BFILE_URL}.`,
+      );
+      expect(calls).toHaveLength(1);
+    });
+
+    it('never says OEIS lacks a term past the first 1 MiB of a b-file served without ranges', async () => {
+      const { text } = oversizedBFile();
+      const head = text.slice(0, ONE_MIB).split('\n');
+      head.pop();
+      const lastFullN = head.length - 1;
+      const { calls, result } = await getTerms(
+        { aNumber: 'A000045', fromIndex: lastFullN + 5 },
+        bFile(text),
+      );
+      expect(terms(result)).toEqual([]);
+      expect(structured(result)).toMatchObject({ bFileCut: true, lastAvailableIndex: lastFullN });
+      expect(structured(result).notice).toBe(
+        `Only the first 1 MiB of the b-file was read; terms past n = ${lastFullN} are at ${FIB_BFILE_URL}.`,
+      );
+      expect(calls).toHaveLength(1);
     });
 
     it('reports the size of a cut 200 when Content-Length is present', async () => {
@@ -377,6 +431,300 @@ describe('oeis_get_terms', () => {
       const again = await runToolContract(oeisGetTerms, { aNumber: 'A45', fromIndex: 10 });
       expect(ns(again)).toEqual([10, 11, 12, 13, 14]);
       expect(calls).toHaveLength(1);
+    });
+  });
+
+  describe('b-file pages past the first 1 MiB', () => {
+    const sigmaFile = () => rangedFile({ body: sigmaBFile(), etag: SIGMA_ETAG });
+    /** The last whole line of A000203's first 1 MiB. */
+    const PAGE0_LAST = 87_084;
+    const sigmaTerms = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({ n: from + i, value: sigmaOf(from + i) }));
+
+    it('reads A000203 at n = 99990–99994 with one ranged request past the first 1 MiB', async () => {
+      const { calls, result } = await getTerms(
+        { aNumber: 'A000203', fromIndex: 99_990, limit: 5 },
+        sigmaFile().step,
+      );
+      expect(result.isError).toBeUndefined();
+      expect(terms(result)).toEqual([
+        { n: 99_990, value: '286416' },
+        { n: 99_991, value: '99992' },
+        { n: 99_992, value: '194400' },
+        { n: 99_993, value: '133328' },
+        { n: 99_994, value: '160254' },
+      ]);
+      expect(structured(result)).toMatchObject({
+        source: 'bfile',
+        firstAvailableIndex: 1,
+        lastAvailableIndex: 100_000,
+        nextFromIndex: 99_995,
+        bFileUrl: SIGMA_BFILE_URL,
+        bFileSizeInBytes: 1_214_182,
+        bFileCut: false,
+        truncated: true,
+        shown: 5,
+        cap: 5,
+      });
+      expect(structured(result).notice).toBe('More terms follow; call again with fromIndex 99995.');
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.url).toBe(SIGMA_BFILE_URL);
+      expect(calls[1]?.headers.get('range')).toBe('bytes=1044480-1214181');
+      expect(calls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+      expect(calls[1]?.init.redirect).toBe('manual');
+
+      const text = textOf(result);
+      for (const term of terms(result)) expect(text).toContain(`a(${term.n}) = ${term.value}`);
+      expect(text).toContain('**Last available index:** 100000');
+      expect(text).toContain('**b-file continues past the last available index:** no');
+      expect(text).toContain('**Next slice:** call again with fromIndex 99995.');
+    });
+
+    it.each([
+      ['one past the last n', 100_001],
+      ['ten times the last n', 1_000_000],
+    ])(
+      'answers a fromIndex %s with the true last index and one page read',
+      async (_label, from) => {
+        const { calls, result } = await getTerms(
+          { aNumber: 'A000203', fromIndex: from },
+          sigmaFile().step,
+        );
+        expect(result.isError).toBeUndefined();
+        expect(terms(result)).toEqual([]);
+        expect(structured(result)).toMatchObject({
+          lastAvailableIndex: 100_000,
+          bFileCut: false,
+          truncated: false,
+          shown: 0,
+        });
+        expect(structured(result)).not.toHaveProperty('nextFromIndex');
+        expect(structured(result).notice).toBe(
+          `No terms at n ≥ ${from} in what OEIS publishes for this entry; the last available index is 100000.`,
+        );
+        expect(textOf(result)).toContain('None in this slice.');
+        expect(calls).toHaveLength(2);
+      },
+    );
+
+    it('makes no request past the first 1 MiB for a fromIndex inside it', async () => {
+      const { calls, result } = await getTerms(
+        { aNumber: 'A000203', fromIndex: PAGE0_LAST - 2, limit: 1000 },
+        sigmaFile().step,
+      );
+      expect(terms(result)).toEqual(sigmaTerms(PAGE0_LAST - 2, 3));
+      expect(structured(result)).toMatchObject({
+        lastAvailableIndex: PAGE0_LAST,
+        nextFromIndex: PAGE0_LAST + 1,
+        bFileCut: true,
+      });
+      expect(textOf(result)).toContain(
+        '**b-file continues past the last available index:** yes, later terms exist at the b-file URL',
+      );
+      expect(calls).toHaveLength(1);
+    });
+
+    it('pages across the join with nextFromIndex, n consecutive, each part read once', async () => {
+      const { service, calls } = serviceOver(sigmaFile().step);
+      holder.service = service;
+      const seen: Term[] = [];
+      let fromIndex: number | undefined = PAGE0_LAST - 6;
+      for (let call = 0; call < 3 && fromIndex !== undefined; call++) {
+        const page = await runToolContract(oeisGetTerms, {
+          aNumber: 'A000203',
+          fromIndex,
+          limit: 10,
+        });
+        expect(page.isError).toBeUndefined();
+        seen.push(...terms(page));
+        fromIndex = structured(page).nextFromIndex as number | undefined;
+      }
+      expect(seen).toEqual([...sigmaTerms(PAGE0_LAST - 6, 7), ...sigmaTerms(PAGE0_LAST + 1, 20)]);
+      expect(fromIndex).toBe(PAGE0_LAST + 21);
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+    });
+
+    it('keeps lastAvailableIndex at the furthest index read when a later call starts in the first 1 MiB', async () => {
+      const { service, calls } = serviceOver(sigmaFile().step);
+      holder.service = service;
+      await runToolContract(oeisGetTerms, { aNumber: 'A000203', fromIndex: 99_990, limit: 1 });
+      const early = await runToolContract(oeisGetTerms, {
+        aNumber: 'A000203',
+        fromIndex: 10,
+        limit: 3,
+      });
+      expect(terms(early)).toEqual(sigmaTerms(10, 3));
+      expect(structured(early)).toMatchObject({
+        lastAvailableIndex: 100_000,
+        nextFromIndex: 13,
+        bFileCut: false,
+      });
+      expect(textOf(early)).toContain('**Last available index:** 100000');
+      expect(textOf(early)).toContain('**b-file continues past the last available index:** no');
+      expect(calls).toHaveLength(2);
+    });
+
+    it('says a fromIndex the page reads did not reach lies past what was read, then finds it on the next call', async () => {
+      const { body, lastN } = steppedBFile();
+      const { service, calls } = serviceOver(rangedFile({ body, etag: '"stepped"' }).step);
+      holder.service = service;
+      const target = lastN - 20;
+      const input = { aNumber: 'A000001', fromIndex: target, limit: 3 };
+
+      const first = await runToolContract(oeisGetTerms, input);
+      expect(first.isError).toBeUndefined();
+      expect(terms(first)).toEqual([]);
+      const unreached = `n = ${target} lies outside the parts of the b-file read so far; call again with fromIndex ${target} to read further, or read the whole file at https://oeis.org/A000001/b000001.txt.`;
+      expect(structured(first)).toMatchObject({
+        bFileCut: true,
+        truncated: false,
+        shown: 0,
+        notice: unreached,
+      });
+      expect(structured(first).lastAvailableIndex).toBeLessThan(target);
+      expect(structured(first)).not.toHaveProperty('nextFromIndex');
+      const text = textOf(first);
+      expect(text).toContain(unreached);
+      expect(text).toContain('None in this slice.');
+      expect(text).toContain('**b-file continues past the last available index:** yes');
+      expect(text).not.toContain('No terms at n');
+      expect(calls).toHaveLength(3);
+
+      const second = await runToolContract(oeisGetTerms, input);
+      expect(terms(second)).toEqual(
+        [target, target + 1, target + 2].map((n) => ({ n, value: '9'.repeat(990) })),
+      );
+      expect(structured(second)).toMatchObject({ nextFromIndex: target + 3, bFileCut: true });
+      expect(structured(second).notice).toBe(
+        `More terms follow; call again with fromIndex ${target + 3}.`,
+      );
+      expect(calls).toHaveLength(4);
+    });
+
+    it('says a line too long to read was skipped just before the slice, on both surfaces', async () => {
+      const { body, longN } = longLineBFile();
+      const { service, calls } = serviceOver(rangedFile({ body, etag: '"long"' }).step);
+      holder.service = service;
+      const tripled = (n: number) => ({ n, value: String(n * 3) });
+
+      const result = await runToolContract(oeisGetTerms, {
+        aNumber: 'A000001',
+        fromIndex: longN,
+        limit: 2,
+      });
+      expect(terms(result)).toEqual([tripled(longN + 1), tripled(longN + 2)]);
+      const skipped = `The b-file line just before n = ${longN + 1} is longer than 4 KiB and spans two of the 1 MiB parts the file is read in, so it was skipped; it is at https://oeis.org/A000001/b000001.txt.`;
+      expect(structured(result).notice).toBe(
+        `${skipped} More terms follow; call again with fromIndex ${longN + 3}.`,
+      );
+      expect(textOf(result)).toContain(skipped);
+      expect(calls).toHaveLength(2);
+
+      const next = await runToolContract(oeisGetTerms, {
+        aNumber: 'A000001',
+        fromIndex: longN + 1,
+        limit: 2,
+      });
+      expect(terms(next)).toEqual([tripled(longN + 1), tripled(longN + 2)]);
+      expect(structured(next).notice).toBe(
+        `More terms follow; call again with fromIndex ${longN + 3}.`,
+      );
+    });
+
+    it('ends the file at its last pair when its final part holds none', async () => {
+      const { body, lastN } = trailingCommentsBFile();
+      const { service, calls } = serviceOver(rangedFile({ body, etag: '"tail"' }).step);
+      holder.service = service;
+      const ended = `No terms at n ≥ ${lastN + 1} in what OEIS publishes for this entry; the last available index is ${lastN}.`;
+      for (let call = 0; call < 2; call++) {
+        const past = await runToolContract(oeisGetTerms, {
+          aNumber: 'A000001',
+          fromIndex: lastN + 1,
+        });
+        expect(terms(past)).toEqual([]);
+        expect(structured(past)).toMatchObject({
+          lastAvailableIndex: lastN,
+          bFileCut: false,
+          notice: ended,
+        });
+      }
+      const tail = await runToolContract(oeisGetTerms, {
+        aNumber: 'A000001',
+        fromIndex: lastN - 1,
+      });
+      expect(ns(tail)).toEqual([lastN - 1, lastN]);
+      expect(structured(tail)).not.toHaveProperty('nextFromIndex');
+      expect(calls).toHaveLength(2);
+    });
+
+    describe('failures on a page request', () => {
+      it('fails the call with upstream_rate_limited on a page 429', async () => {
+        const { calls, result } = await getTerms(
+          { aNumber: 'A000203', fromIndex: 99_990 },
+          sigmaFile().step,
+          res('slow down', { status: 429, headers: { 'retry-after': '120' } }),
+        );
+        expect(result.isError).toBe(true);
+        expect(errorOf(result)).toMatchObject({
+          code: JsonRpcErrorCode.RateLimited,
+          data: {
+            reason: 'upstream_rate_limited',
+            retryAfter: '120',
+            recovery: { hint: expect.stringContaining('oeis_get_terms again') },
+          },
+        });
+        expect(textOf(result)).toContain('reason upstream_rate_limited');
+        expect(calls).toHaveLength(2);
+        expect(calls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+      });
+
+      it('fails the call with pacer_shed when the queue cannot start a page request in time', async () => {
+        const pacer = createPacer({
+          name: 'oeis-terms-tool-test',
+          minStartGapMs: 10_000,
+          maxConcurrent: 1,
+        });
+        try {
+          const { calls, fetch } = scriptedFetch(sigmaFile().step);
+          holder.service = new OeisService({ fetch, pacer, queueMaxWaitMs: 1_000 });
+          const result = await runToolContract(oeisGetTerms, {
+            aNumber: 'A000203',
+            fromIndex: 99_990,
+          });
+          expect(result.isError).toBe(true);
+          expect(errorOf(result)).toMatchObject({
+            code: JsonRpcErrorCode.RateLimited,
+            data: {
+              reason: 'pacer_shed',
+              retryAfter: expect.anything(),
+              recovery: { hint: expect.stringContaining('oeis_get_terms again') },
+            },
+          });
+          expect(textOf(result)).toContain('reason pacer_shed');
+          expect(calls).toHaveLength(1);
+        } finally {
+          pacer.dispose();
+        }
+      });
+
+      it('settles a call aborted during a page request as RequestCancelled', async () => {
+        const controller = new AbortController();
+        const { calls, service } = serviceOver(sigmaFile().step, (call) => {
+          controller.abort();
+          return hang(call.init.signal);
+        });
+        holder.service = service;
+        const result = await runToolContract(
+          oeisGetTerms,
+          { aNumber: 'A000203', fromIndex: 99_990 },
+          { context: { signal: controller.signal } },
+        );
+        expect(result.isError).toBe(true);
+        expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+        expect(calls).toHaveLength(2);
+        expect(calls[1]?.headers.get('if-range')).toBe(SIGMA_ETAG);
+      });
     });
   });
 
@@ -792,6 +1140,31 @@ describe('oeis_get_terms', () => {
       expect(structured(result)).not.toHaveProperty('firstAvailableIndex');
       expect(structured(result).notice).toBe('OEIS publishes no terms for this entry.');
     });
+
+    it('never says OEIS publishes no terms when the first 1 MiB of a longer b-file holds none', async () => {
+      const body = `# ${'x'.repeat(ONE_MIB)}\n0 0\n1 1\n`;
+      const { calls, result } = await getTerms(
+        { aNumber: 'A000045' },
+        rangedFile({ body, etag: '"v1"' }).step,
+      );
+      expect(result.isError).toBeUndefined();
+      expect(structured(result)).toMatchObject({
+        source: 'bfile',
+        terms: [],
+        bFileCut: true,
+        truncated: false,
+        shown: 0,
+      });
+      expect(structured(result)).not.toHaveProperty('firstAvailableIndex');
+      expect(structured(result)).not.toHaveProperty('lastAvailableIndex');
+      expect(structured(result).notice).toBe(
+        `Only the first 1 MiB of the b-file was read, and it holds no terms; the rest of the file is at ${FIB_BFILE_URL}.`,
+      );
+      const text = textOf(result);
+      expect(text).toContain('**First available index:** none in the first 1 MiB of the b-file');
+      expect(text).not.toContain('OEIS publishes no terms');
+      expect(calls).toHaveLength(1);
+    });
   });
 
   describe('required enrichment', () => {
@@ -1072,7 +1445,7 @@ describe('oeis_get_terms', () => {
       expect(text).toContain('**Last available index:** 14');
       expect(text).toContain(`**b-file:** ${FIB_BFILE_URL}`);
       expect(text).toContain(`**b-file size:** ${fibonacciBFile.length} bytes`);
-      expect(text).toContain('**b-file cut at 1 MiB:** no');
+      expect(text).toContain('**b-file continues past the last available index:** no');
       expect(text).toContain('**URL:** https://oeis.org/A000045');
       for (const term of terms(result)) expect(text).toContain(`a(${term.n}) = ${term.value}`);
       expect(text).toContain('**Next slice:** call again with fromIndex 4.');
@@ -1084,7 +1457,7 @@ describe('oeis_get_terms', () => {
         bFilePartial(fibonacciBFile, fibonacciBFile.length + 10_000),
       );
       expect(textOf(result)).toContain(
-        '**b-file cut at 1 MiB:** yes, later terms exist at the b-file URL',
+        '**b-file continues past the last available index:** yes, later terms exist at the b-file URL',
       );
     });
 

@@ -45,7 +45,7 @@ function fitToBudget(window: BFileTerm[]): BFileTerm[] {
 export const oeisGetTerms = tool('oeis_get_terms', {
   title: 'Get OEIS Sequence Terms',
   description:
-    "List terms a(n) of a sequence with their indices n. Reads the entry's b-file when it has one — often thousands of terms beyond the data line — and otherwise the data line itself. Values are exact decimal strings of any size. A slice stops at limit terms or at about 100,000 bytes, whichever comes first; nextFromIndex continues it.",
+    "List terms a(n) of a sequence with their indices n. Reads the entry's b-file when it has one — often thousands of terms beyond the data line — and otherwise the data line itself. Values are exact decimal strings of any size. A slice stops at limit terms, at about 100,000 bytes, or at the end of one 1 MiB part of a larger b-file, whichever comes first; nextFromIndex continues it.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     aNumber: ANumberSchema,
@@ -53,7 +53,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       'First index n to return; defaults to the first available index. Pass nextFromIndex from the previous call to continue.',
     ),
     limit: blankAsUnset(z.number().int().min(1).max(1000).default(100)).describe(
-      'Maximum number of terms to return, 1–1000 (default 100). A slice of large terms stops sooner, at about 100,000 bytes; continue with nextFromIndex.',
+      'Maximum number of terms to return, 1–1000 (default 100). A slice stops sooner at about 100,000 bytes of large terms or at the end of one 1 MiB part of a larger b-file; continue with nextFromIndex.',
     ),
   }),
   output: z.object({
@@ -72,22 +72,24 @@ export const oeisGetTerms = tool('oeis_get_terms', {
           })
           .describe('One term.'),
       )
-      .describe('Terms in index order, starting at fromIndex (or the first available index).'),
+      .describe(
+        'Terms in index order, from the first index at or after fromIndex (or the first available index).',
+      ),
     firstAvailableIndex: z
       .number()
       .optional()
-      .describe('Lowest index n read for this entry; absent when OEIS publishes no terms.'),
+      .describe('Lowest index n read for this entry; absent when no terms were read.'),
     lastAvailableIndex: z
       .number()
       .optional()
       .describe(
-        'Highest index n read for this entry (within the first 1 MiB of a b-file); absent when OEIS publishes no terms.',
+        'Highest index n read so far for this entry; when bFileCut is true the b-file goes on past it. Absent when no terms were read.',
       ),
     nextFromIndex: z
       .number()
       .optional()
       .describe(
-        'Pass as fromIndex for the next slice; absent when no further terms were read past this one.',
+        'Pass as fromIndex for the next slice. Absent when no slice follows this one: the terms ended, or the notice says how to reach the rest.',
       ),
     bFileUrl: z
       .string()
@@ -100,19 +102,19 @@ export const oeisGetTerms = tool('oeis_get_terms', {
     bFileCut: z
       .boolean()
       .describe(
-        'True when the b-file is larger than the 1 MiB this server reads, so terms past lastAvailableIndex exist at bFileUrl.',
+        'True while the b-file goes on past lastAvailableIndex. Its later terms are at bFileUrl; nextFromIndex or a larger fromIndex reaches them unless the notice says only the first 1 MiB was read.',
       ),
     url: z.string().describe('Sequence page on oeis.org; cite it wherever the terms are reused.'),
   }),
   enrichment: {
-    truncated: z.boolean().describe('True when more terms were read than this slice shows.'),
+    truncated: z.boolean().describe('True when nextFromIndex is set.'),
     shown: z.number().describe('Terms in this slice.'),
     cap: z.number().describe('The limit that was applied.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance: where the next slice starts and whether the byte budget ended this one, why no terms came back, or that the terms are data-line only or cut at 1 MiB.',
+        'Guidance: where the next slice starts and whether the byte budget ended this one, why no terms came back (past the last index, or not yet reached in a large b-file), that a b-file line too long to read was skipped, that only the first 1 MiB of the b-file could be read, or that the terms are data-line only.',
       ),
   },
   errors: [
@@ -151,11 +153,16 @@ export const oeisGetTerms = tool('oeis_get_terms', {
 
     const cached = service.getCachedRecord(aNumber);
     const knownWithoutBFile = cached !== undefined && !cached.bFileUrl;
-    const bFile = knownWithoutBFile ? undefined : await service.getBFile(aNumber, ctx);
+    const bFile = knownWithoutBFile
+      ? undefined
+      : await service.getBFile(aNumber, ctx, { fromIndex });
 
+    const read = bFile?.status === 'ok' ? bFile : undefined;
     let terms: BFileTerm[];
-    if (bFile?.status === 'ok') {
-      terms = bFile.terms;
+    let first: number | undefined;
+    let last: number | undefined;
+    if (read) {
+      ({ terms, firstIndex: first, lastIndex: last } = read);
     } else {
       const record = await service.getRecord(aNumber, ctx, {
         deadlineMs: Math.max(0, DEFAULT_DEADLINE_MS - (Date.now() - startedAt)),
@@ -169,39 +176,56 @@ export const oeisGetTerms = tool('oeis_get_terms', {
         firstIndex === undefined
           ? []
           : record.terms.map((value, i) => ({ n: firstIndex + i, value }));
+      first = terms[0]?.n;
+      last = terms.at(-1)?.n;
     }
-    const source: 'bfile' | 'data' = bFile?.status === 'ok' ? 'bfile' : 'data';
-    const bFileCut = bFile?.status === 'ok' && bFile.cut;
+    const source: 'bfile' | 'data' = read ? 'bfile' : 'data';
+    const bFileCut = read?.cut === true;
 
     const found = fromIndex === undefined ? 0 : terms.findIndex((term) => term.n >= fromIndex);
     const begin = found === -1 ? terms.length : found;
     const window = terms.slice(begin, begin + limit);
     const slice = fitToBudget(window);
-    const next = terms[begin + slice.length];
-    const first = terms[0];
-    const last = terms.at(-1);
+    // A slice that reaches the end of a b-file page continues in the next page.
+    const next = terms[begin + slice.length]?.n ?? (slice.length > 0 ? read?.nextIndex : undefined);
     ctx.enrich({ shown: slice.length });
 
     const notices: string[] = [];
-    if (!last) notices.push('OEIS publishes no terms for this entry.');
-    if (last && fromIndex !== undefined && fromIndex > last.n) {
+    if (last === undefined) {
       notices.push(
-        `No terms at n ≥ ${fromIndex} in what OEIS publishes for this entry; the last available index is ${last.n}.`,
+        bFileCut
+          ? `Only the first 1 MiB of the b-file was read, and it holds no terms; the rest of the file is at ${bFileUrl(aNumber)}.`
+          : 'OEIS publishes no terms for this entry.',
       );
     }
-    if (bFileCut && last) {
+    if (last !== undefined && fromIndex !== undefined && fromIndex > last && !bFileCut) {
       notices.push(
-        `Only the first 1 MiB of the b-file was read; terms past n = ${last.n} are at ${bFileUrl(aNumber)}.`,
+        `No terms at n ≥ ${fromIndex} in what OEIS publishes for this entry; the last available index is ${last}.`,
+      );
+    }
+    if (read?.unreached) {
+      notices.push(
+        `n = ${fromIndex} lies outside the parts of the b-file read so far; call again with fromIndex ${fromIndex} to read further, or read the whole file at ${bFileUrl(aNumber)}.`,
+      );
+    }
+    if (read?.firstMibOnly && last !== undefined) {
+      notices.push(
+        `Only the first 1 MiB of the b-file was read; terms past n = ${last} are at ${bFileUrl(aNumber)}.`,
+      );
+    }
+    if (read?.skippedLine && terms[0]) {
+      notices.push(
+        `The b-file line just before n = ${terms[0].n} is longer than 4 KiB and spans two of the 1 MiB parts the file is read in, so it was skipped; it is at ${bFileUrl(aNumber)}.`,
       );
     }
     if (source === 'data') {
       notices.push('This entry has no b-file; these are the data-line terms only.');
     }
-    if (next) {
+    if (next !== undefined) {
       notices.push(
         slice.length < window.length
-          ? `Stopped after ${slice.length} ${slice.length === 1 ? 'term' : 'terms'} to stay within the 100,000-byte response budget; call again with fromIndex ${next.n}.`
-          : `More terms follow; call again with fromIndex ${next.n}.`,
+          ? `Stopped after ${slice.length} ${slice.length === 1 ? 'term' : 'terms'} to stay within the 100,000-byte response budget; call again with fromIndex ${next}.`
+          : `More terms follow; call again with fromIndex ${next}.`,
       );
       ctx.enrich.truncated({ shown: slice.length, cap: limit, guidance: notices.join(' ') });
     } else if (notices.length) {
@@ -212,12 +236,11 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       aNumber,
       source,
       terms: slice,
-      ...(first && { firstAvailableIndex: first.n }),
-      ...(last && { lastAvailableIndex: last.n }),
-      ...(next && { nextFromIndex: next.n }),
+      ...(first !== undefined && { firstAvailableIndex: first }),
+      ...(last !== undefined && { lastAvailableIndex: last }),
+      ...(next !== undefined && { nextFromIndex: next }),
       ...(source === 'bfile' && { bFileUrl: bFileUrl(aNumber) }),
-      ...(bFile?.status === 'ok' &&
-        bFile.sizeInBytes !== undefined && { bFileSizeInBytes: bFile.sizeInBytes }),
+      ...(read?.sizeInBytes !== undefined && { bFileSizeInBytes: read.sizeInBytes }),
       bFileCut,
       url: `https://oeis.org/${aNumber}`,
     };
@@ -228,9 +251,12 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       `# ${result.aNumber} terms`,
       '',
       `**Source:** ${result.source === 'bfile' ? 'bfile (the b-file of extended terms)' : 'data (the data line; this entry has no b-file)'}`,
-      result.firstAvailableIndex === undefined
-        ? '**First available index:** none (OEIS publishes no terms)'
-        : `**First available index:** ${result.firstAvailableIndex}`,
+      `**First available index:** ${
+        result.firstAvailableIndex ??
+        (result.bFileCut
+          ? 'none in the first 1 MiB of the b-file'
+          : 'none (OEIS publishes no terms)')
+      }`,
     ];
     if (result.lastAvailableIndex !== undefined) {
       lines.push(`**Last available index:** ${result.lastAvailableIndex}`);
@@ -240,7 +266,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       lines.push(`**b-file size:** ${result.bFileSizeInBytes} bytes`);
     }
     lines.push(
-      `**b-file cut at 1 MiB:** ${result.bFileCut ? 'yes, later terms exist at the b-file URL' : 'no'}`,
+      `**b-file continues past the last available index:** ${result.bFileCut ? 'yes, later terms exist at the b-file URL' : 'no'}`,
       `**URL:** ${result.url}`,
       '',
       '## Terms',
