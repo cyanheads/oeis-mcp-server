@@ -209,12 +209,12 @@ const REFERENCE: Record<Topic, ReferenceTable> = {
       {
         name: 'data line',
         description:
-          'The terms an entry displays, about three lines (~260 characters). oeis_identify_sequence searches these.',
+          'The first terms an entry displays, at most about 270 characters. oeis_identify_sequence and an oeis_search_sequences run of terms (bare numbers, seq:, or signed:) match only these, never the b-file.',
       },
       {
         name: 'b-file',
         description:
-          'A text file at https://oeis.org/A######/b######.txt listing "n a(n)" pairs far beyond the data line. oeis_get_terms reads it (the first 1 MiB).',
+          'A text file at https://oeis.org/A######/b######.txt listing "n a(n)" pairs far beyond the data line. oeis_get_terms reads it, one part of up to 1 MiB at a time.',
       },
       {
         name: 'referenceCount',

@@ -6,6 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { DATA_LINE_SENTENCE, likelyPastDataLine } from '@/mcp-server/shared/data-line-limit.js';
 import { inline, summaryLines } from '@/mcp-server/shared/markdown.js';
 import {
   blankAsUnset,
@@ -103,11 +104,21 @@ function gcd(a: bigint, b: bigint): bigint {
   return x;
 }
 
-/** Composes the zero-hit guidance from the conditions that hold for the supplied run. */
+/**
+ * Composes the zero-hit guidance from the conditions that hold for the supplied run. When the run
+ * likely lies past every data line, the data-line sentence adds to the drop advice rather than
+ * replacing it, since dropping a wrong first term still recovers a large-term run that is in one.
+ */
 function zeroHitNotice(supplied: readonly string[], matchSigns: boolean): string {
+  const pastDataLine = likelyPastDataLine(supplied);
   const parts = ['No OEIS entry contains these terms consecutively in its data line.'];
+  if (pastDataLine) parts.push(DATA_LINE_SENTENCE);
   if (supplied.length >= 5) {
-    parts.push('Drop the first term or two and retry; sequences often start at a different index.');
+    parts.push(
+      pastDataLine
+        ? 'If these are the earliest terms you have, drop the first one and retry in case it is wrong.'
+        : 'Drop the first term or two and retry; sequences often start at a different index.',
+    );
   }
   if (matchSigns) parts.push('Retry with matchSigns false to ignore sign conventions.');
   if (['0', '1', '-1'].includes(supplied[0] ?? '')) {
@@ -132,7 +143,7 @@ function zeroHitNotice(supplied: readonly string[], matchSigns: boolean): string
 export const oeisIdentifySequence = tool('oeis_identify_sequence', {
   title: 'Identify OEIS Sequence',
   description:
-    'Identify integer sequences that contain a run of consecutive terms, e.g. "1, 2, 5, 14, 42". Returns up to 10 matches per page in OEIS relevance order, each with the index n at which the supplied run begins. For the best hit rate supply about 6 terms and leave off the first one or two, since sources disagree on where a sequence starts. Takes up to 60 terms, each an integer of at most 200 digits or the wildcard _ for one unknown term.',
+    'Identify integer sequences that contain a run of consecutive terms, e.g. "1, 2, 5, 14, 42". Returns up to 10 matches per page in OEIS relevance order, each with the index n at which the supplied run begins. For the best hit rate supply about 6 terms and leave off the first one or two, since sources disagree on where a sequence starts. OEIS matches only the first terms of each entry (its data line, at most about 270 characters), not its b-file, so a run from far into a sequence is not found. Takes up to 60 terms, each an integer of at most 200 digits or the wildcard _ for one unknown term.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     terms: z

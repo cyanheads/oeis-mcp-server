@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oeisIdentifySequence } from '@/mcp-server/tools/definitions/oeis-identify-sequence.tool.js';
 import { OeisService } from '@/services/oeis/oeis-service.js';
 import {
+  capturedSearchRecords,
   clampedSearchPage,
   fibonacciSearchRecord,
   htmlMaintenanceBody,
@@ -36,7 +37,15 @@ vi.mock('@/services/oeis/oeis-service.js', async (importOriginal) => ({
 }));
 
 type Result = Awaited<ReturnType<typeof runToolContract>>;
-type Row = { aNumber: string; matchStartIndex?: number; name: string; terms: string[] };
+type Row = {
+  aNumber: string;
+  author?: string;
+  legacyIds?: string[];
+  matchStartIndex?: number;
+  modified?: string;
+  name: string;
+  terms: string[];
+};
 
 const page = (body: string) => res(body, { status: 200 });
 
@@ -406,6 +415,40 @@ describe('oeis_identify_sequence', () => {
         page(rowPage({ terms: ['1', '2', '3'], offset: '1,2' })),
       );
       expect(rows(result)[0]).not.toHaveProperty('matchStartIndex');
+    });
+
+    it('sits beside the row author, modified, and legacyIds, which leave it unchanged', async () => {
+      const body = searchPageText({
+        query: 'seq:2,5,14,42',
+        status: 'Showing 1-2 of 2',
+        records: [capturedSearchRecords.A033191, capturedSearchRecords.A007318],
+      });
+      const { result } = await identify({ terms: '2, 5, 14, 42' }, page(body));
+      const [located, notLocated] = rows(result);
+      expect(located).toMatchObject({
+        aNumber: 'A033191',
+        matchStartIndex: 2,
+        author: 'Simon P. Norton',
+        modified: '2026-06-30T19:56:59-04:00',
+      });
+      expect(located).not.toHaveProperty('legacyIds');
+      expect(notLocated).toMatchObject({
+        aNumber: 'A007318',
+        author: '_N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994',
+        modified: '2026-09-25T10:59:50-04:00',
+        legacyIds: ['M0082'],
+      });
+      expect(notLocated).not.toHaveProperty('matchStartIndex');
+
+      const [first, second] = textOf(result).split('\n\n## ').slice(1);
+      expect(first).toContain('**Run starts at:** n = 2\n**Terms:** 1, 1, 2, 5, 14, 42,');
+      expect(first).toContain(
+        '**Keywords:** nonn, easy\n**Author:** Simon P. Norton\n**Modified:** 2026-06-30T19:56:59-04:00\n**URL:** https://oeis.org/A033191',
+      );
+      expect(second).toContain('**Run starts at:** not located in the data line');
+      expect(second).toContain(
+        '**Author:** _N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994\n**Legacy IDs:** M0082\n**Modified:** 2026-09-25T10:59:50-04:00',
+      );
     });
 
     it('omits it for a row whose data line is empty', async () => {
@@ -827,6 +870,218 @@ describe('oeis_identify_sequence', () => {
       const { result } = await identify({ terms: '1, 2, 5, 14' }, page(pageOf(2, 2)));
       expect(structured(result).notice).toBeUndefined();
     });
+
+    describe('data-line limit', () => {
+      const OPENING = 'No OEIS entry contains these terms consecutively in its data line.';
+      const RETRY =
+        'Drop the first term or two and retry; sequences often start at a different index.';
+      const DATA_LINE =
+        'OEIS matches only the first terms of each entry (its data line, at most about 270 characters), so a long run or one from far into a sequence is not found; give about 6 of the earliest terms you have.';
+      const DROP_FIRST =
+        'If these are the earliest terms you have, drop the first one and retry in case it is wrong.';
+      const CLOSING =
+        'For words, formulas, or prefixes call oeis_search_sequences; oeis_list_reference topic search_syntax lists the syntax.';
+      const FACTOR = (g: bigint) =>
+        `The terms share a common factor of ${g}; try the terms divided by ${g}.`;
+      const TODAY = [OPENING, RETRY, CLOSING].join(' ');
+      const PAST_DATA_LINE =
+        'No OEIS entry contains these terms consecutively in its data line. OEIS matches only the first terms of each entry (its data line, at most about 270 characters), so a long run or one from far into a sequence is not found; give about 6 of the earliest terms you have. If these are the earliest terms you have, drop the first one and retry in case it is wrong. For words, formulas, or prefixes call oeis_search_sequences; oeis_list_reference topic search_syntax lists the syntax.';
+
+      const fib = (n: number) => {
+        let [a, b] = [0n, 1n];
+        for (let i = 0; i < n; i++) [a, b] = [b, a + b];
+        return a;
+      };
+      const fibs = (from: number, to: number) =>
+        Array.from({ length: to - from + 1 }, (_, i) => fib(from + i)).join(', ');
+      const pow2 = (from: number, to: number) =>
+        Array.from({ length: to - from + 1 }, (_, i) => 2n ** BigInt(from + i)).join(', ');
+      /** `count` consecutive four-digit terms from 1000, comma-joined as the tool normalizes them. */
+      const fourDigit = (count: number) =>
+        Array.from({ length: count }, (_, i) => String(1000 + i)).join(',');
+
+      /** Runs a zero-hit identify and asserts `expected` on structuredContent and in the content[] trailer. */
+      async function zeroHitNotice(input: Record<string, unknown>, expected: string) {
+        const { result } = await identify(input, page(noResultsSearchPage));
+        expect(result.isError).toBeUndefined();
+        expect(structured(result).notice).toBe(expected);
+        expect(textOf(result)).toContain(`> ${expected}`);
+      }
+
+      it('states the data-line limit in the tool description, after the start-index advice', () => {
+        expect(oeisIdentifySequence.description).toContain(
+          'since sources disagree on where a sequence starts. OEIS matches only the first terms of each entry (its data line, at most about 270 characters), not its b-file, so a run from far into a sequence is not found. Takes up to 60 terms',
+        );
+      });
+
+      it('pins the whole notice for a zero-hit run of five small terms', async () => {
+        await zeroHitNotice({ terms: '3, 7, 12, 19, 28' }, TODAY);
+      });
+
+      it('pins the whole notice when every condition but the data-line one holds', async () => {
+        await zeroHitNotice(
+          { terms: '2, 4, 6, 8, 10', matchSigns: true },
+          [OPENING, RETRY, SIGNS, FACTOR(2n), CLOSING].join(' '),
+        );
+      });
+
+      it('keeps the notice for F(40)..F(44), whose terms have nine digits', async () => {
+        expect(fibs(40, 44)).toBe('102334155, 165580141, 267914296, 433494437, 701408733');
+        await zeroHitNotice({ terms: fibs(40, 44) }, TODAY);
+      });
+
+      it.each([
+        [
+          'one nine-digit term among ten-digit ones',
+          '999999999, 1134903170, 1836311903, 2971215073, 4807526976',
+        ],
+        [
+          'a nine-digit term written with a sign, ten characters long',
+          '-999999999, 1134903170, 1836311903, 2971215073, 4807526976',
+        ],
+        [
+          'a nine-digit term padded with a leading zero',
+          '0999999999, 1134903170, 1836311903, 2971215073, 4807526976',
+        ],
+      ])('keeps the notice for %s', async (_case, terms) => {
+        await zeroHitNotice({ terms }, TODAY);
+      });
+
+      it('keeps the notice for a run of only 0 and _ terms', async () => {
+        await zeroHitNotice(
+          { terms: '0, _, 0, _, 0' },
+          [OPENING, RETRY, LEADING, CLOSING, FEW].join(' '),
+        );
+      });
+
+      it('keeps the notice for normalized terms of exactly 270 characters', async () => {
+        const terms = `${fourDigit(53)},10000`;
+        expect(terms).toHaveLength(270);
+        await zeroHitNotice({ terms }, TODAY);
+      });
+
+      it("names the data line for F(60)..F(64), which lie past A000045's data line", async () => {
+        expect(fibs(60, 64)).toBe(
+          '1548008755920, 2504730781961, 4052739537881, 6557470319842, 10610209857723',
+        );
+        await zeroHitNotice({ terms: fibs(60, 64) }, PAST_DATA_LINE);
+      });
+
+      it('keeps the drop-first advice for a large-term run with a wrong first term (13!+1, 14!..17!)', async () => {
+        await zeroHitNotice(
+          { terms: '6227020801, 87178291200, 1307674368000, 20922789888000, 355687428096000' },
+          PAST_DATA_LINE,
+        );
+      });
+
+      it('names the data line for 60 four-digit terms, longer than any data line', async () => {
+        const terms = fourDigit(60);
+        expect(terms.split(',')).toHaveLength(60);
+        expect(terms.length).toBeGreaterThan(270);
+        await zeroHitNotice({ terms }, PAST_DATA_LINE);
+      });
+
+      it('names the data line from 271 normalized characters', async () => {
+        const terms = `${fourDigit(53)},100000`;
+        expect(terms).toHaveLength(271);
+        await zeroHitNotice({ terms }, PAST_DATA_LINE);
+      });
+
+      it('measures the length on the normalized run, not on the pasted text', async () => {
+        const pasted = `[ ${fourDigit(53).replaceAll(',', ',   ')}, 10000 ... ]`;
+        expect(pasted.length).toBeGreaterThan(270);
+        await zeroHitNotice({ terms: pasted }, TODAY);
+      });
+
+      it('names the data line from exactly 10 digits, counting absolute values', async () => {
+        await zeroHitNotice(
+          { terms: '1000000000, 1000000001, 1000000002, 1000000003, 1000000004' },
+          PAST_DATA_LINE,
+        );
+        await zeroHitNotice(
+          {
+            terms: '-1548008755920, 2504730781961, -4052739537881, 6557470319842, -10610209857723',
+          },
+          PAST_DATA_LINE,
+        );
+      });
+
+      it.each([
+        ['primes p(1000)..p(1005)', '7919, 7927, 7933, 7937, 7949, 7951'],
+        ['squares of 100..104', '10000, 10201, 10404, 10609, 10816'],
+        [
+          'five terms whose largest is exactly 1.1 times the smallest',
+          '1000, 1021, 1043, 1067, 1100',
+        ],
+      ])(
+        'names the data line for %s: four-digit terms within 10% of each other',
+        async (_case, terms) => {
+          await zeroHitNotice({ terms }, PAST_DATA_LINE);
+        },
+      );
+
+      it.each([
+        ['a spread past 10%', '1000, 1021, 1043, 1067, 1101', TODAY],
+        ['a three-digit term', '999, 1001, 1003, 1005, 1007', TODAY],
+        ['a _ among them', '7919, _, 7933, 7937, 7949', TODAY],
+        ['four terms', '7919, 7927, 7933, 7937', [OPENING, CLOSING].join(' ')],
+      ])('keeps the notice for slow four-digit terms with %s', async (_case, terms, expected) => {
+        await zeroHitNotice({ terms }, expected);
+      });
+
+      it('skips _ and 0 terms in the digit test', async () => {
+        await zeroHitNotice({ terms: `_, 0, ${fibs(60, 62)}` }, PAST_DATA_LINE);
+      });
+
+      it('gives no drop advice of either kind below five terms', async () => {
+        await zeroHitNotice({ terms: fibs(60, 63) }, [OPENING, DATA_LINE, CLOSING].join(' '));
+      });
+
+      it('composes with the few-terms notice for a single large term', async () => {
+        await zeroHitNotice({ terms: fibs(60, 60) }, [OPENING, DATA_LINE, CLOSING, FEW].join(' '));
+      });
+
+      it.each([
+        [
+          'the matchSigns segment',
+          { terms: fibs(60, 64), matchSigns: true },
+          [OPENING, DATA_LINE, DROP_FIRST, SIGNS, CLOSING],
+        ],
+        [
+          'the leading-0 segment',
+          { terms: `0, ${fibs(60, 63)}` },
+          [OPENING, DATA_LINE, DROP_FIRST, LEADING, CLOSING],
+        ],
+        [
+          'the common-factor segment',
+          { terms: pow2(40, 44) },
+          [OPENING, DATA_LINE, DROP_FIRST, FACTOR(2n ** 40n), CLOSING],
+        ],
+        [
+          'all three segments together',
+          { terms: `0, ${pow2(40, 43)}`, matchSigns: true },
+          [OPENING, DATA_LINE, DROP_FIRST, SIGNS, LEADING, FACTOR(2n ** 40n), CLOSING],
+        ],
+      ])('keeps %s in its place after the data-line sentence', async (_case, input, parts) => {
+        await zeroHitNotice(input, parts.join(' '));
+      });
+
+      it('adds no zero-hit text to a large-term run that hits', async () => {
+        const complete = await identify({ terms: fibs(60, 64) }, page(pageOf(2, 2)));
+        expect(structured(complete.result).notice).toBeUndefined();
+        expect(textOf(complete.result)).not.toContain('OEIS matches only the first terms');
+
+        const paged = await identify({ terms: fibs(60, 64) }, page(pageOf(10, 26)));
+        expect(structured(paged.result).notice).toBe(
+          'Showing 1-10 of 26; call again with start 10 for the next page.',
+        );
+
+        const tooMany = await identify({ terms: fourDigit(60) }, page(tooManySearchPage));
+        expect(structured(tooMany.result).notice).toBe(
+          'OEIS matched too many entries to list for these terms. Add more consecutive terms.',
+        );
+      });
+    });
   });
 
   describe('upstream failures', () => {
@@ -1019,6 +1274,9 @@ describe('oeis_identify_sequence', () => {
         expect(text).toContain(row.aNumber);
         expect(text).toContain(row.name);
         expect(text).toContain(`**Terms:** ${row.terms.join(', ')}`);
+        expect(text).toContain(`**Author:** ${row.author}`);
+        expect(text).toContain(`**Legacy IDs:** ${row.legacyIds?.join(', ')}`);
+        expect(text).toContain(`**Modified:** ${row.modified}`);
         expect(text).toContain(`https://oeis.org/${row.aNumber}`);
       }
       expect(text).toContain('# Sequence candidates (start 0)');
@@ -1069,6 +1327,38 @@ describe('oeis_identify_sequence', () => {
       expect(blocksText(oeisIdentifySequence.format?.(base))).not.toContain('Next page');
       expect(blocksText(oeisIdentifySequence.format?.({ ...base, nextStart: 30 }))).toContain(
         '**Next page:** call again with start 30.',
+      );
+    });
+
+    it('renders a row without author, modified, or legacyIds as the run line and summary lines alone', () => {
+      const text = blocksText(
+        oeisIdentifySequence.format?.({
+          results: [
+            {
+              aNumber: 'A000108',
+              name: 'Catalan numbers.',
+              terms: ['1', '1', '2', '5'],
+              offset: '0,3',
+              firstIndex: 0,
+              keywords: ['core', 'nonn'],
+              url: 'https://oeis.org/A000108',
+              matchStartIndex: 1,
+            },
+          ],
+          start: 0,
+        }),
+      );
+      expect(text).toBe(
+        [
+          '# Sequence candidates (start 0)',
+          '',
+          '## 1. A000108: Catalan numbers.',
+          '**Run starts at:** n = 1',
+          '**Terms:** 1, 1, 2, 5',
+          '**Offset:** 0,3 (first term is a(0))',
+          '**Keywords:** core, nonn',
+          '**URL:** https://oeis.org/A000108',
+        ].join('\n'),
       );
     });
   });
