@@ -133,7 +133,7 @@ const RelatedSchema = z
     resolved: z
       .boolean()
       .describe(
-        'True when name and terms were fetched. False when OEIS returned no record for this A-number or the lookup could not be made (see notice); name, terms, offset, firstIndex, and keywords are then absent.',
+        'True when name and terms were fetched. False when OEIS returned no record for this A-number or the lookup could not be made (see notice); name, terms, offset, firstIndex, keywords, author, legacyIds, and modified are then absent.',
       ),
     name: z
       .string()
@@ -158,6 +158,24 @@ const RelatedSchema = z
       .optional()
       .describe(
         'Keyword flags such as nonn, core, tabl (oeis_list_reference topic keywords decodes them); absent when not resolved.',
+      ),
+    author: z
+      .string()
+      .optional()
+      .describe(
+        'Author line as OEIS records it, written by OEIS contributors; absent when not resolved, and when the entry has none, as on a reserved or recycled A-number.',
+      ),
+    legacyIds: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Legacy book numbers, e.g. ["M0692", "N0256"]; absent when not resolved, on entries that have none, and when OEIS sends no readable edit line.',
+      ),
+    modified: z
+      .string()
+      .optional()
+      .describe(
+        'When the entry was last edited, ISO 8601 with offset, e.g. "2026-09-23T16:08:09-04:00"; absent when not resolved, and when OEIS sends no readable edit time.',
       ),
     url: z.string().describe('Sequence page on oeis.org; cite it wherever the entry is reused.'),
     note: z
@@ -372,6 +390,9 @@ export const oeisGetCrossRefs = tool('oeis_get_cross_refs', {
       if (row.keywords) {
         out.push(`**Keywords:** ${row.keywords.length ? inline(row.keywords.join(', ')) : 'none'}`);
       }
+      if (row.author !== undefined) out.push(`**Author:** ${inline(row.author)}`);
+      if (row.legacyIds) out.push(`**Legacy IDs:** ${inline(row.legacyIds.join(', '))}`);
+      if (row.modified !== undefined) out.push(`**Modified:** ${inline(row.modified)}`);
       out.push(`**URL:** ${row.url}`);
     });
     if (result.lines) {

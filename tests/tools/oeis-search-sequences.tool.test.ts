@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oeisSearchSequences } from '@/mcp-server/tools/definitions/oeis-search-sequences.tool.js';
 import { OeisService } from '@/services/oeis/oeis-service.js';
 import {
+  capturedSearchRecords,
   clampedSearchPage,
   htmlMaintenanceBody,
   moebiusSearchRecord,
@@ -37,8 +38,11 @@ vi.mock('@/services/oeis/oeis-service.js', async (importOriginal) => ({
 type Result = Awaited<ReturnType<typeof runToolContract>>;
 type Row = {
   aNumber: string;
+  author?: string;
   firstIndex: number;
   keywords: string[];
+  legacyIds?: string[];
+  modified?: string;
   name: string;
   offset: string;
   terms: string[];
@@ -219,10 +223,85 @@ describe('oeis_search_sequences', () => {
           offset: '0,3',
           firstIndex: 0,
           keywords: ['core', 'nonn', 'easy', 'eigen', 'nice', 'changed'],
+          author: '_N. J. A. Sloane_, Apr 30 1991',
+          modified: '2026-09-15T21:11:07-04:00',
+          legacyIds: ['M1459', 'N0577'],
           url: 'https://oeis.org/A000108',
         },
         expect.objectContaining({ aNumber: 'A000045', firstIndex: 0 }),
       ]);
+    });
+
+    it('carries author, modified, and legacyIds on each row, and leaves out what a row lacks', async () => {
+      const body = searchPageText({
+        query: 'keyword:core',
+        status: 'Showing 1-4 of 4',
+        records: [
+          capturedSearchRecords.A000045,
+          capturedSearchRecords.A399236,
+          capturedSearchRecords.A397217,
+          capturedSearchRecords.A395050,
+        ],
+      });
+      const { result } = await search({ query: 'keyword:core', sort: 'modified' }, page(body));
+      expect(result.isError).toBeUndefined();
+      const [fibonacci, knight, reserved, recycled] = rows(result);
+      expect(fibonacci).toMatchObject({
+        aNumber: 'A000045',
+        author: '_N. J. A. Sloane_, 1964',
+        modified: '2026-09-23T16:08:09-04:00',
+        legacyIds: ['M0692', 'N0256'],
+      });
+      expect(knight).toMatchObject({
+        aNumber: 'A399236',
+        author: '_Benjamin Simon Strang_, Aug 23 2026',
+        modified: '2026-10-01T14:35:22-04:00',
+      });
+      expect(knight).not.toHaveProperty('legacyIds');
+      expect(reserved).toMatchObject({ aNumber: 'A397217', modified: '2026-09-29T20:19:41-04:00' });
+      expect(recycled).toMatchObject({ aNumber: 'A395050', modified: '2026-09-22T17:49:40-04:00' });
+      for (const row of [reserved, recycled]) {
+        expect(row).not.toHaveProperty('author');
+        expect(row).not.toHaveProperty('legacyIds');
+      }
+
+      const sections = textOf(result).split('\n\n## ').slice(1);
+      expect(sections[0]).toContain(
+        [
+          '**Keywords:** nonn, core, nice, easy, hear, changed',
+          '**Author:** _N. J. A. Sloane_, 1964',
+          '**Legacy IDs:** M0692, N0256',
+          '**Modified:** 2026-09-23T16:08:09-04:00',
+          '**URL:** https://oeis.org/A000045',
+        ].join('\n'),
+      );
+      expect(sections[1]).toContain('**Author:** _Benjamin Simon Strang_, Aug 23 2026');
+      expect(sections[1]).not.toContain('**Legacy IDs:**');
+      for (const [i, row] of [reserved, recycled].entries()) {
+        expect(sections[i + 2]).toContain(`**Modified:** ${row?.modified}`);
+        expect(sections[i + 2]).not.toContain('**Author:**');
+        expect(sections[i + 2]).not.toContain('**Legacy IDs:**');
+      }
+    });
+
+    it('carries the fields on every row of a full page and of the last page OEIS clamps to', async () => {
+      const full = await search(
+        { query: 'prime', start: 10 },
+        page(syntheticSearchPage({ count: 10, firstRow: 11, total: 183 })),
+      );
+      const clamped = await search({ query: '1,2,5,14,42', start: 30 }, page(clampedSearchPage));
+      expect(structured(full.result)).toMatchObject({ truncated: true, shown: 10, nextStart: 20 });
+      expect(structured(clamped.result)).toMatchObject({ start: 20, shown: 6 });
+      for (const { result } of [full, clamped]) {
+        for (const row of rows(result)) {
+          expect(row).toMatchObject({
+            author: '_N. J. A. Sloane_, Apr 30 1991',
+            modified: '2026-09-15T21:11:07-04:00',
+            legacyIds: ['M0692', 'N0256'],
+          });
+        }
+        expect(textOf(result).match(/\*\*Modified:\*\* /g)).toHaveLength(rows(result).length);
+      }
     });
 
     it('keeps signed terms and a non-zero first index', async () => {
@@ -436,6 +515,133 @@ describe('oeis_search_sequences', () => {
         page(syntheticSearchPage({ count: 4, total: 4 })),
       );
       expect(structured(result).notice).toBeUndefined();
+    });
+
+    describe('data-line limit on a query OEIS reads as one run', () => {
+      const DATA_LINE =
+        'OEIS matches only the first terms of each entry (its data line, at most about 270 characters), so a long run or one from far into a sequence is not found; give about 6 of the earliest terms you have.';
+      const PAST_DATA_LINE = `${DATA_LINE} ${NUMBERS}`;
+      const F60_64 = '1548008755920 2504730781961 4052739537881 6557470319842 10610209857723';
+      /** `count` consecutive four-digit terms from 1000, joined by `separator`. */
+      const fourDigit = (count: number, separator: string) =>
+        Array.from({ length: count }, (_, i) => String(1000 + i)).join(separator);
+      /** The echo OEIS gives bare numbers it reads as one run: `seq:` and the terms joined by commas. */
+      const seqEcho = (query: string) => `seq:${query.split(/[\s,]+/).join(',')}`;
+
+      /**
+       * Runs a zero-hit search whose `Search:` line echoes `echo`, and asserts `expected` on
+       * structuredContent and in the content[] trailer.
+       */
+      async function zeroHitNotice(
+        input: { query: string; start?: number },
+        expected: string,
+        echo = seqEcho(input.query),
+      ) {
+        const noHits = searchPageText({ query: echo, status: 'No results.' });
+        const { result } = await search(input, page(noHits));
+        expect(result.isError).toBeUndefined();
+        expect(structured(result).notice).toBe(expected);
+        expect(textOf(result)).toContain(`> ${expected}`);
+      }
+
+      it('pins the whole notice for a numbers-only zero-hit of small terms', async () => {
+        await zeroHitNotice({ query: '3 7 12 19 28' }, NUMBERS);
+      });
+
+      it('keeps the notice for F(40)..F(44), whose terms have nine digits', async () => {
+        await zeroHitNotice(
+          { query: '102334155 165580141 267914296 433494437 701408733' },
+          NUMBERS,
+        );
+      });
+
+      it('keeps the notice for a run of zeros', async () => {
+        await zeroHitNotice({ query: '0 0 0 0 0' }, NUMBERS);
+      });
+
+      it('measures the length on the terms joined with commas, not on the query as written', async () => {
+        const query = `${fourDigit(53, ', ')}, 10000`;
+        expect(query.length).toBeGreaterThan(270);
+        expect(query.split(', ').join(',')).toHaveLength(270);
+        await zeroHitNotice({ query }, NUMBERS);
+      });
+
+      it('names the data line before the term-run advice for F(60)..F(64)', async () => {
+        await zeroHitNotice({ query: F60_64 }, PAST_DATA_LINE);
+      });
+
+      it.each([
+        ['commas', F60_64.replaceAll(' ', ',')],
+        ['commas and spaces', F60_64.replaceAll(' ', ', ')],
+        [
+          'signs, counted by absolute value',
+          '-6227020801, 87178291200, -1307674368000, 20922789888000',
+        ],
+        ['a leading 0, which the digit test skips', `0 ${F60_64}`],
+        ['60 four-digit terms, longer than any data line', fourDigit(60, ' ')],
+      ])('names the data line for a run written with %s', async (_case, query) => {
+        await zeroHitNotice({ query }, PAST_DATA_LINE);
+      });
+
+      it.each([
+        ['a seq: prefix', `seq:${F60_64.replaceAll(' ', ',')}`],
+        ['a signed: prefix', `signed:${F60_64.replaceAll(' ', ',')}`],
+        ['a seq: prefix on a single large term', 'seq:10610209857723'],
+      ])(
+        'names the data line for a run written with %s, which OEIS echoes as written',
+        async (_case, query) => {
+          await zeroHitNotice({ query }, PAST_DATA_LINE, query);
+        },
+      );
+
+      it('leaves the sentence out when OEIS splits spaced numbers apart at a negative term', async () => {
+        // OEIS echoes `1 -1 -1 0 -1 1 -1 0 0 1` as `1 seq:-1 seq:-1 0 seq:-1 1 seq:-1,0,0,1`.
+        await zeroHitNotice(
+          { query: '-6227020801 87178291200 -1307674368000 20922789888000' },
+          NUMBERS,
+          'seq:-6227020801 87178291200 seq:-1307674368000 20922789888000',
+        );
+      });
+
+      it('names the data line from 271 characters joined with commas', async () => {
+        const query = `${fourDigit(53, ' ')} 100000`;
+        expect(query.replaceAll(' ', ',')).toHaveLength(271);
+        await zeroHitNotice({ query }, PAST_DATA_LINE);
+      });
+
+      it('gives the same notice at a later start', async () => {
+        await zeroHitNotice({ query: F60_64, start: 10 }, PAST_DATA_LINE);
+      });
+
+      it.each([
+        ['a subseq: prefix', `subseq:${F60_64.replaceAll(' ', ',')}`, LOOSEN],
+        ['a word', `fibonacci ${F60_64}`, LOOSEN],
+        ['a _ wildcard', `_ ${F60_64}`, LOOSEN],
+        [
+          'an unknown prefix',
+          `foo:${F60_64}`,
+          `"foo:" is not an OEIS prefix, so OEIS searched it as plain words. ${SYNTAX}`,
+        ],
+      ])(
+        'never adds the sentence to a large-term query with %s',
+        async (_case, query, expected) => {
+          await zeroHitNotice({ query }, expected, query);
+        },
+      );
+
+      it('adds no zero-hit text to a large-term numbers-only query that hits', async () => {
+        const { result } = await search(
+          { query: F60_64 },
+          page(syntheticSearchPage({ count: 2, total: 2 })),
+        );
+        expect(structured(result).notice).toBeUndefined();
+        expect(textOf(result)).not.toContain('OEIS matches only the first terms');
+
+        const tooMany = await search({ query: fourDigit(60, ' ') }, page(tooManySearchPage));
+        expect(structured(tooMany.result).notice).toBe(
+          'OEIS matched too many entries to list. Add a word, a quoted phrase, or a prefix such as keyword:nice or author:<name>.',
+        );
+      });
     });
   });
 
@@ -733,6 +939,9 @@ describe('oeis_search_sequences', () => {
         expect(text).toContain(`**Terms:** ${row.terms.join(', ')}`);
         expect(text).toContain(`**Offset:** ${row.offset} (first term is a(${row.firstIndex}))`);
         expect(text).toContain(`**Keywords:** ${row.keywords.join(', ')}`);
+        expect(text).toContain(`**Author:** ${row.author}`);
+        expect(text).toContain(`**Legacy IDs:** ${row.legacyIds?.join(', ')}`);
+        expect(text).toContain(`**Modified:** ${row.modified}`);
         expect(text).toContain(`**URL:** ${row.url}`);
       });
     });
@@ -797,6 +1006,53 @@ describe('oeis_search_sequences', () => {
       expect(blocksText(oeisSearchSequences.format?.(base))).not.toContain('Next page');
       expect(blocksText(oeisSearchSequences.format?.({ ...base, nextStart: 30 }))).toContain(
         '**Next page:** call again with start 30.',
+      );
+    });
+
+    it('renders rows without author, modified, or legacyIds as the summary lines alone', () => {
+      const text = blocksText(
+        oeisSearchSequences.format?.({
+          results: [
+            {
+              aNumber: 'A000045',
+              name: 'Fibonacci numbers.',
+              terms: ['0', '1', '1'],
+              offset: '0,4',
+              firstIndex: 0,
+              keywords: ['nonn', 'core'],
+              url: 'https://oeis.org/A000045',
+            },
+            {
+              aNumber: 'A397217',
+              name: 'allocated for Jane Doe',
+              terms: [],
+              keywords: ['allocated'],
+              url: 'https://oeis.org/A397217',
+            },
+          ],
+          start: 0,
+          nextStart: 10,
+          sort: 'modified',
+        }),
+      );
+      expect(text).toBe(
+        [
+          '# OEIS search results (start 0, sort modified)',
+          '',
+          '## 1. A000045: Fibonacci numbers.',
+          '**Terms:** 0, 1, 1',
+          '**Offset:** 0,4 (first term is a(0))',
+          '**Keywords:** nonn, core',
+          '**URL:** https://oeis.org/A000045',
+          '',
+          '## 2. A397217: allocated for Jane Doe',
+          '**Terms:** none listed',
+          '**Offset:** none (reserved or recycled A-number)',
+          '**Keywords:** allocated',
+          '**URL:** https://oeis.org/A397217',
+          '',
+          '**Next page:** call again with start 10.',
+        ].join('\n'),
       );
     });
   });

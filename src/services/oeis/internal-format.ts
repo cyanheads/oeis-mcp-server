@@ -1,6 +1,7 @@
 /**
  * @fileoverview Parser for OEIS `/search?fmt=text` responses (the internal format): the `Search:`
- * echo, the status line, and the `%S %T %U %N %K %O` lines of each record.
+ * echo, the status line, and the `%I %S %T %U %N %K %O %A` lines of each record. `%I` and `%A`
+ * give a row the author, last edit, and legacy ids the JSON record carries, in the record's format.
  * @module services/oeis/internal-format
  */
 
@@ -13,9 +14,30 @@ const NO_RESULTS = 'No results.';
 const TOO_MANY = 'Too many results. Please narrow search.';
 /** `s`: a stray CR or U+2028/U+2029 inside a line stays in the value instead of failing the match. */
 const RECORD_LINE = /^%([A-Za-z]) (A\d{6,7})(?: (.*))?$/s;
+/**
+ * A `%I` value: legacy book ids, the `#` revision, and the wall-clock time of the last edit, e.g.
+ * `M0692 N0256 #2594 Sep 23 2026 16:08:09`. Every token is fixed-width or ends at a character the
+ * next token cannot start with, so a failed match is linear in the value.
+ */
+const ID_LINE =
+  /^((?:[MN]\d{4} +)*)#\d+ +([A-Z][a-z]{2}) +(\d{2}) +(\d{4}) +(\d{2}):(\d{2}):(\d{2})$/;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const MINUTE_MS = 60_000;
+const DAY_MS = 86_400_000;
+/**
+ * Names America/New_York's offset from UTC at an instant, e.g. `GMT-04:00`. `%I` writes the time
+ * there with no zone: it matches the JSON record's `time` in that zone, summer and winter.
+ */
+const NEW_YORK = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  timeZoneName: 'longOffset',
+});
+const OFFSET_NAME = /^GMT([+-])(\d{2}):(\d{2})$/;
 
 interface RecordLines {
+  author?: string;
   data: string[];
+  idLine?: string;
   keywords?: string;
   name?: string;
   offset?: string;
@@ -53,13 +75,66 @@ function firstIndexOf(aNumber: string, offset: string): number {
   return firstIndex;
 }
 
-/** One summary row. A reserved or recycled row has no `%O` line, so no offset or firstIndex. */
+/**
+ * America/New_York's offset from UTC at an instant, in minutes (−240 in daylight time); undefined
+ * where it is not a whole number of minutes (local mean time, before 1883).
+ */
+function newYorkOffset(epochMs: number): number | undefined {
+  const name = NEW_YORK.formatToParts(epochMs).find((part) => part.type === 'timeZoneName');
+  const match = OFFSET_NAME.exec(name?.value ?? '');
+  if (!match) return;
+  const minutes = Number(match[2]) * 60 + Number(match[3]);
+  return match[1] === '-' ? -minutes : minutes;
+}
+
+/**
+ * Appends America/New_York's offset to a wall-clock time `local` (`YYYY-MM-DDTHH:MM:SS`, whose
+ * value read as UTC is `asUtc`). Of the zone's offsets a day either side, the larger one that holds
+ * at the time wins, so a time the fall-back hour repeats reads as its first, daylight-time instance;
+ * when neither holds, the time lies in the skipped spring-forward hour and takes the offset before
+ * the change.
+ */
+function newYorkIso(local: string, asUtc: number): string | undefined {
+  const before = newYorkOffset(asUtc - DAY_MS);
+  const after = newYorkOffset(asUtc + DAY_MS);
+  if (before === undefined || after === undefined) return;
+  const holds = (offset: number) => newYorkOffset(asUtc - offset * MINUTE_MS) === offset;
+  const offset = [Math.max(before, after), Math.min(before, after)].find(holds) ?? before;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const minutes = Math.abs(offset);
+  return `${local}${offset < 0 ? '-' : '+'}${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}`;
+}
+
+/**
+ * The legacy ids and last edit a `%I` value carries, in the record's formats. Empty when the value
+ * is missing, in another shape, or names a date or time that does not exist; a row never fails on it.
+ */
+function readIdLine(value: string | undefined): Pick<SequenceSummary, 'legacyIds' | 'modified'> {
+  const match = ID_LINE.exec(value?.trim() ?? '');
+  if (!match) return {};
+  const [, ids = '', monthName = '', day = '', year = '', hour = '', minute = '', second = ''] =
+    match;
+  const month = MONTHS.indexOf(monthName);
+  const local = `${year}-${String(month + 1).padStart(2, '0')}-${day}T${hour}:${minute}:${second}`;
+  const asUtc = Date.UTC(+year, month, +day, +hour, +minute, +second);
+  if (new Date(asUtc).toISOString().slice(0, 19) !== local) return {};
+  const modified = newYorkIso(local, asUtc);
+  if (modified === undefined) return {};
+  const legacyIds = ids.split(' ').filter(Boolean);
+  return { ...(legacyIds.length > 0 && { legacyIds }), modified };
+}
+
+/**
+ * One summary row. A reserved or recycled row has no `%O` line, so no offset or firstIndex, and no
+ * `%A` line, so no author.
+ */
 function toSummary(aNumber: string, lines: RecordLines): SequenceSummary {
   if (lines.name === undefined) formatChanged(`record ${aNumber} has no %N line`);
   const keywords = splitList(lines.keywords ?? '');
   if (lines.offset === undefined && !isReservedEntry(keywords)) {
     formatChanged(`record ${aNumber} has no %O line`);
   }
+  const author = lines.author && stripNonWebHrefs(lines.author).trim();
   return {
     aNumber,
     name: stripNonWebHrefs(lines.name),
@@ -69,6 +144,8 @@ function toSummary(aNumber: string, lines: RecordLines): SequenceSummary {
       firstIndex: firstIndexOf(aNumber, lines.offset),
     }),
     keywords,
+    ...(author && { author }),
+    ...readIdLine(lines.idLine),
     url: `https://oeis.org/${aNumber}`,
   };
 }
@@ -105,6 +182,9 @@ export function parseSearchText(text: string): SearchPage {
         records.set(aNumber, rec);
       }
       switch (tag) {
+        case 'I':
+          rec.idLine = value;
+          break;
         case 'S':
         case 'T':
         case 'U':
@@ -118,6 +198,9 @@ export function parseSearchText(text: string): SearchPage {
           break;
         case 'O':
           rec.offset = value;
+          break;
+        case 'A':
+          rec.author = value;
           break;
       }
     }

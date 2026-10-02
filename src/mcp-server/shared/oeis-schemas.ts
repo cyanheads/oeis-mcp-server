@@ -90,6 +90,24 @@ export const SequenceSummarySchema = z.object({
     .describe(
       'Keyword flags such as nonn, core, tabl; oeis_list_reference topic keywords decodes them.',
     ),
+  author: z
+    .string()
+    .optional()
+    .describe(
+      'Author line as OEIS records it, written by OEIS contributors; absent when the entry has none, as on a reserved or recycled A-number.',
+    ),
+  legacyIds: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Legacy book numbers, e.g. ["M0692", "N0256"]; absent on entries that have none, and when OEIS sends no readable edit line.',
+    ),
+  modified: z
+    .string()
+    .optional()
+    .describe(
+      'When the entry was last edited, ISO 8601 with offset, e.g. "2026-09-23T16:08:09-04:00"; absent when OEIS sends no readable edit time.',
+    ),
   url: z.string().describe('Sequence page on oeis.org; cite it wherever the entry is reused.'),
 });
 

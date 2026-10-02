@@ -9,6 +9,7 @@ import type { z } from '@cyanheads/mcp-ts-core';
 import { describe, expect, it } from 'vitest';
 import { blockquote, fence, inline, summaryLines } from '@/mcp-server/shared/markdown.js';
 import type { SequenceSummarySchema } from '@/mcp-server/shared/oeis-schemas.js';
+import { cpuMs } from '../fixtures/cpu-time.js';
 
 type Row = z.infer<typeof SequenceSummarySchema>;
 
@@ -144,9 +145,7 @@ describe('markup in contributor text', () => {
     ['bracketed lines', '[\n'.repeat(MIB / 2)],
   ])('escapes 1 MiB of %s in linear time', (_shape, text) => {
     for (const render of [inline, blockquote]) {
-      const started = performance.now();
-      render(text);
-      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(cpuMs(() => render(text))).toBeLessThan(1_000);
     }
   });
 });
@@ -210,6 +209,49 @@ describe('summaryLines', () => {
   it('renders a negative first index as given', () => {
     expect(summaryLines({ ...row, offset: '-2,1', firstIndex: -2 })[1]).toBe(
       '**Offset:** -2,1 (first term is a(-2))',
+    );
+  });
+
+  it('adds the author, legacy IDs, and last edit after the keywords, before the URL', () => {
+    expect(
+      summaryLines({
+        ...row,
+        author: '_N. J. A. Sloane_',
+        modified: '2026-09-15T21:11:07-04:00',
+        legacyIds: ['M1459', 'N0577'],
+      }),
+    ).toEqual([
+      '**Terms:** 1, 1, 2, 5',
+      '**Offset:** 0,3 (first term is a(0))',
+      '**Keywords:** core, nonn',
+      '**Author:** _N. J. A. Sloane_',
+      '**Legacy IDs:** M1459, N0577',
+      '**Modified:** 2026-09-15T21:11:07-04:00',
+      '**URL:** https://oeis.org/A000108',
+    ]);
+  });
+
+  it('adds a line only for each field the row carries', () => {
+    expect(summaryLines({ ...row, modified: '2026-09-29T20:19:41-04:00' })).toEqual([
+      '**Terms:** 1, 1, 2, 5',
+      '**Offset:** 0,3 (first term is a(0))',
+      '**Keywords:** core, nonn',
+      '**Modified:** 2026-09-29T20:19:41-04:00',
+      '**URL:** https://oeis.org/A000108',
+    ]);
+    expect(summaryLines({ ...row, author: 'Simon P. Norton' })).toContain(
+      '**Author:** Simon P. Norton',
+    );
+    expect(summaryLines({ ...row, legacyIds: ['M2975'] })).toContain('**Legacy IDs:** M2975');
+  });
+
+  it('escapes link, image, and HTML openers in the author and flattens its line breaks', () => {
+    const [, , , author] = summaryLines({
+      ...row,
+      author: '<a>Eve</a> [site](https://attacker.example) ![x](y)\r\n# Mallory',
+    });
+    expect(author).toBe(
+      '**Author:** \\<a>Eve\\</a> [site\\](https://attacker.example) !\\[x\\](y) # Mallory',
     );
   });
 });

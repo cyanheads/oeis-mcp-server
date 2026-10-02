@@ -6,6 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { DATA_LINE_SENTENCE, likelyPastDataLine } from '@/mcp-server/shared/data-line-limit.js';
 import { inline, summaryLines } from '@/mcp-server/shared/markdown.js';
 import {
   blankAsUnset,
@@ -49,6 +50,12 @@ const KNOWN_PREFIXES = new Set([
 ]);
 
 const NUMBERS_ONLY = /^-?\d+(?:[\s,]+-?\d+)*$/;
+/**
+ * The `Search:` echo of a query OEIS matched as one run of consecutive terms. Bare numbers come back
+ * as `seq:` with the terms joined by commas, except numbers separated only by spaces with a negative
+ * among them, which OEIS splits apart.
+ */
+const TERM_RUN = /^(?:seq|signed):(-?\d+(?:,-?\d+)*)$/;
 
 /** `word:` prefixes in the query that OEIS does not recognize; quoted phrases are skipped. */
 function unknownPrefixes(query: string): string[] {
@@ -63,9 +70,10 @@ function unknownPrefixes(query: string): string[] {
 /**
  * Composes the zero-hit guidance from the conditions that hold for the query. The requested start
  * plays no part: OEIS serves the last page for a start past the end, so "No results." at any
- * start means the query matches nothing.
+ * start means the query matches nothing. A query OEIS echoes as one `seq:` or `signed:` run is
+ * matched as `oeis_identify_sequence` matches its terms, so it is held to the same data-line limit.
  */
-function zeroHitNotice(query: string): string {
+function zeroHitNotice(query: string, effectiveQuery: string): string {
   const parts: string[] = [];
   const unknown = unknownPrefixes(query);
   if (unknown.length) {
@@ -77,7 +85,9 @@ function zeroHitNotice(query: string): string {
       'oeis_list_reference topic search_syntax lists the valid prefixes.',
     );
   }
-  if (NUMBERS_ONLY.test(query)) {
+  const run = TERM_RUN.exec(effectiveQuery)?.[1];
+  if (run !== undefined && likelyPastDataLine(run.split(','))) parts.push(DATA_LINE_SENTENCE);
+  if (run !== undefined || NUMBERS_ONLY.test(query)) {
     parts.push(
       'Drop the first term or two and retry, since sources disagree on where a sequence starts; or put subseq: before the terms to match them with other terms in between.',
     );
@@ -165,7 +175,7 @@ export const oeisSearchSequences = tool('oeis_search_sequences', {
         `Start ${input.start} is past the last of ${page.total} results; this is the last page, from start ${start}.`,
       );
     }
-    if (page.status === 'none') notices.push(zeroHitNotice(input.query));
+    if (page.status === 'none') notices.push(zeroHitNotice(input.query, page.effectiveQuery));
     if (page.status === 'too_many') {
       notices.push(
         'OEIS matched too many entries to list. Add a word, a quoted phrase, or a prefix such as keyword:nice or author:<name>.',

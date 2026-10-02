@@ -15,7 +15,9 @@ import { createPacer } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oeisGetCrossRefs } from '@/mcp-server/tools/definitions/oeis-get-cross-refs.tool.js';
 import { OeisService } from '@/services/oeis/oeis-service.js';
+import { cpuMsAsync } from '../fixtures/cpu-time.js';
 import {
+  capturedSearchRecords,
   fibonacciRecordJson,
   fibonacciSearchRecord,
   htmlMaintenanceBody,
@@ -42,9 +44,12 @@ vi.mock('@/services/oeis/oeis-service.js', async (importOriginal) => ({
 type Result = Awaited<ReturnType<typeof runToolContract>>;
 type Related = {
   aNumber: string;
+  author?: string;
   firstIndex?: number;
   keywords?: string[];
+  legacyIds?: string[];
   lineIndex?: number;
+  modified?: string;
   name?: string;
   note?: string;
   offset?: string;
@@ -285,6 +290,60 @@ describe('oeis_get_cross_refs', () => {
       expect(textOf(result)).toContain('**Resolved:** no (name and terms not fetched)');
     });
 
+    it('carries author, modified, and legacyIds on resolved rows and none on an unresolved one', async () => {
+      const batch = searchPageText({
+        query: 'id:a007318|id:a033191|id:a001045',
+        status: 'Showing 1-2 of 2',
+        records: [capturedSearchRecords.A007318, capturedSearchRecords.A033191],
+      });
+      const { result } = await crossRefs(
+        { aNumber: 'A45' },
+        record(withXref(['Cf. A007318 (Pascal), A033191, A001045.'])),
+        page(batch),
+      );
+      expect(result.isError).toBeUndefined();
+      const [pascal, norton, unresolved] = related(result);
+      expect(pascal).toMatchObject({
+        aNumber: 'A007318',
+        resolved: true,
+        note: 'Pascal',
+        author: '_N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994',
+        modified: '2026-09-25T10:59:50-04:00',
+        legacyIds: ['M0082'],
+      });
+      expect(norton).toMatchObject({
+        aNumber: 'A033191',
+        resolved: true,
+        author: 'Simon P. Norton',
+        modified: '2026-06-30T19:56:59-04:00',
+      });
+      expect(norton).not.toHaveProperty('legacyIds');
+      expect(unresolved).toEqual({
+        aNumber: 'A001045',
+        resolved: false,
+        url: 'https://oeis.org/A001045',
+        lineIndex: 0,
+      });
+
+      const [first, second, third] = textOf(result).split('\n\n## ').slice(1);
+      expect(first).toContain(
+        [
+          '**Keywords:** nonn, tabl, nice, easy, core, look, hear, changed',
+          '**Author:** _N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994',
+          '**Legacy IDs:** M0082',
+          '**Modified:** 2026-09-25T10:59:50-04:00',
+          '**URL:** https://oeis.org/A007318',
+        ].join('\n'),
+      );
+      expect(second).toContain(
+        '**Author:** Simon P. Norton\n**Modified:** 2026-06-30T19:56:59-04:00',
+      );
+      expect(second).not.toContain('**Legacy IDs:**');
+      for (const label of ['**Author:**', '**Legacy IDs:**', '**Modified:**']) {
+        expect(third).not.toContain(label);
+      }
+    });
+
     it('keeps a resolved row with no terms and no keywords', async () => {
       const sparse = searchPageText({
         query: 'id:a000032',
@@ -398,9 +457,8 @@ describe('oeis_get_cross_refs', () => {
 
       it('reads 1 MiB of mentions before unclosed parentheses in linear time', async () => {
         const line = `Cf. ${'A000032 ('.repeat(Math.floor((1024 * 1024) / 9))}`;
-        const started = performance.now();
-        const rows = await refsOf([line]);
-        expect(performance.now() - started).toBeLessThan(1_000);
+        let rows: Awaited<ReturnType<typeof refsOf>> = [];
+        expect(await cpuMsAsync(async () => (rows = await refsOf([line])))).toBeLessThan(1_000);
         expect(rows.map((row) => [row.aNumber, row.note])).toEqual([['A000032', undefined]]);
       });
     });
@@ -596,6 +654,18 @@ describe('oeis_get_cross_refs', () => {
         });
         expect(structured(last.result)).not.toHaveProperty('nextStart');
         expect(structured(last.result).notice).toBeUndefined();
+
+        for (const { result } of [middle, last]) {
+          for (const row of related(result)) {
+            expect(row).toMatchObject({
+              resolved: true,
+              author: '_N. J. A. Sloane_, Apr 30 1991',
+              modified: '2026-09-15T21:11:07-04:00',
+              legacyIds: ['M0692', 'N0256'],
+            });
+          }
+          expect(textOf(result).match(/\*\*Modified:\*\* /g)).toHaveLength(related(result).length);
+        }
       });
 
       it('serves the record from the cache across pages', async () => {
@@ -980,6 +1050,46 @@ describe('oeis_get_cross_refs', () => {
       expect(structured(result).notice).toBeUndefined();
     });
 
+    it('carries author, modified, and legacyIds on every mentioning entry, on both surfaces', async () => {
+      const body = searchPageText({
+        query: 'a000108 -id:a000108',
+        status: 'Showing 1-3 of 3',
+        records: [
+          capturedSearchRecords.A068875,
+          capturedSearchRecords.A005700,
+          capturedSearchRecords.A397217,
+        ],
+      });
+      const { result } = await crossRefs({ aNumber: 'A108', direction: 'incoming' }, page(body));
+      expect(result.isError).toBeUndefined();
+      const [winter, legacy, reserved] = related(result);
+      expect(winter).toMatchObject({
+        aNumber: 'A068875',
+        resolved: true,
+        author: '_N. J. A. Sloane_, Jun 06 2002',
+        modified: '2026-01-15T13:24:20-05:00',
+      });
+      expect(winter).not.toHaveProperty('legacyIds');
+      expect(legacy).toMatchObject({
+        aNumber: 'A005700',
+        author: '_N. J. A. Sloane_',
+        modified: '2026-07-30T18:33:54-04:00',
+        legacyIds: ['M2975'],
+      });
+      expect(reserved).toMatchObject({ aNumber: 'A397217', modified: '2026-09-29T20:19:41-04:00' });
+      expect(reserved).not.toHaveProperty('author');
+
+      const [first, second, third] = textOf(result).split('\n\n## ').slice(1);
+      expect(first).toContain(
+        '**Author:** _N. J. A. Sloane_, Jun 06 2002\n**Modified:** 2026-01-15T13:24:20-05:00\n**URL:** https://oeis.org/A068875',
+      );
+      expect(second).toContain(
+        '**Author:** _N. J. A. Sloane_\n**Legacy IDs:** M2975\n**Modified:** 2026-07-30T18:33:54-04:00',
+      );
+      expect(third).toContain('**Modified:** 2026-09-29T20:19:41-04:00');
+      expect(third).not.toContain('**Author:**');
+    });
+
     it('pages by start and offers nextStart within the window', async () => {
       const { calls, result } = await crossRefs(
         incoming({ start: 30 }),
@@ -1308,6 +1418,9 @@ describe('oeis_get_cross_refs', () => {
         expect(text).toContain(`**Offset:** ${row.offset}`);
         expect(text).toContain(`**First term:** a(${row.firstIndex})`);
         expect(text).toContain(`**Keywords:** ${row.keywords?.join(', ')}`);
+        expect(text).toContain(`**Author:** ${row.author}`);
+        expect(text).toContain(`**Legacy IDs:** ${row.legacyIds?.join(', ')}`);
+        expect(text).toContain(`**Modified:** ${row.modified}`);
         expect(text).toContain(`**URL:** ${row.url}`);
       });
       expect(text).toContain('**Note:** Lucas');
@@ -1416,6 +1529,98 @@ describe('oeis_get_cross_refs', () => {
       expect(text).not.toContain('Next page');
       expect(blocksText(oeisGetCrossRefs.format?.({ ...base, nextStart: 10 }))).toContain(
         '**Next page:** call again with start 10.',
+      );
+    });
+
+    it('renders the author, legacy IDs, and last edit of a resolved row, with markup in the author escaped', () => {
+      const text = blocksText(
+        oeisGetCrossRefs.format?.({
+          aNumber: 'A000108',
+          direction: 'incoming',
+          related: [
+            {
+              aNumber: 'A000002',
+              resolved: true,
+              name: 'x',
+              terms: ['1'],
+              keywords: ['nonn'],
+              author: '<a>Eve</a> [site](https://attacker.example)\n# Mallory',
+              legacyIds: ['M0001', 'N0002'],
+              modified: '2026-11-01T01:30:00-04:00',
+              url: 'https://oeis.org/A000002',
+            },
+          ],
+          start: 0,
+        }),
+      );
+      expect(text).toContain(
+        [
+          '**Keywords:** nonn',
+          '**Author:** \\<a>Eve\\</a> [site\\](https://attacker.example) # Mallory',
+          '**Legacy IDs:** M0001, N0002',
+          '**Modified:** 2026-11-01T01:30:00-04:00',
+          '**URL:** https://oeis.org/A000002',
+        ].join('\n'),
+      );
+      expect(text.split('\n').filter((line) => line.startsWith('#'))).toEqual([
+        '# Entries that mention A000108 (start 0)',
+        '## 1. A000002: x',
+      ]);
+    });
+
+    it('renders resolved and unresolved rows without author, modified, or legacyIds line for line', () => {
+      const text = blocksText(
+        oeisGetCrossRefs.format?.({
+          aNumber: 'A000045',
+          direction: 'outgoing',
+          related: [
+            {
+              aNumber: 'A000032',
+              resolved: true,
+              name: 'Lucas numbers.',
+              terms: ['2', '1', '3'],
+              offset: '0,1',
+              firstIndex: 0,
+              keywords: ['nonn', 'core'],
+              url: 'https://oeis.org/A000032',
+              note: 'Lucas',
+              lineIndex: 0,
+            },
+            { aNumber: 'A001045', resolved: false, url: 'https://oeis.org/A001045', lineIndex: 0 },
+          ],
+          lines: ['Cf. A000032 (Lucas), A001045.'],
+          start: 0,
+          nextStart: 10,
+        }),
+      );
+      expect(text).toBe(
+        [
+          '# Sequences A000045 cross-references (start 0)',
+          '',
+          '**Direction:** outgoing',
+          '',
+          '## 1. A000032: Lucas numbers.',
+          '**Resolved:** yes',
+          '**Note:** Lucas',
+          '**Cross-reference line:** 0',
+          '**Terms:** 2, 1, 3',
+          '**Offset:** 0,1',
+          '**First term:** a(0)',
+          '**Keywords:** nonn, core',
+          '**URL:** https://oeis.org/A000032',
+          '',
+          '## 2. A001045',
+          '**Resolved:** no (name and terms not fetched)',
+          '**Cross-reference line:** 0',
+          '**URL:** https://oeis.org/A001045',
+          '',
+          '## Cross-reference lines',
+          '',
+          'Line 0:',
+          '> Cf. A000032 (Lucas), A001045.',
+          '',
+          '**Next page:** call again with start 10.',
+        ].join('\n'),
       );
     });
   });

@@ -7,10 +7,19 @@
 export interface SequenceSummary {
   /** Zero-padded A-number, e.g. `A000108`. */
   aNumber: string;
+  /** Author line from `%A`, as the record's `author`; absent on a reserved or recycled A-number. */
+  author?: string;
   /** First integer of `offset`: the index n of the first term. Absent with `offset`. */
   firstIndex?: number;
   /** Keyword flags from `%K`. */
   keywords: string[];
+  /** Legacy book ids from `%I`, e.g. `["M0692", "N0256"]`; absent when it names none or is unreadable. */
+  legacyIds?: string[];
+  /**
+   * Last edit from `%I`, read as America/New_York time and written ISO 8601 with offset, as the
+   * record's `modified`; absent when `%I` is missing or unreadable.
+   */
+  modified?: string;
   /** Sequence name from `%N`. */
   name: string;
   /** Offset line from `%O`, e.g. `"0,3"`; absent on a reserved or recycled A-number. */
@@ -129,16 +138,43 @@ export interface BFileTerm {
   value: string;
 }
 
-/** Result of reading a b-file. */
+/**
+ * Result of reading a b-file. A file is read in pages of up to 1 MiB: the first page (bytes 0 to
+ * 1 MiB − 1) on every call, and a later page only when `fromIndex` lies past the first.
+ */
 export type BFileRead =
   | {
-      /** True when the file exceeds the 1 MiB read and was cut. */
+      /** True while the file goes on past `lastIndex`. */
       cut: boolean;
+      /** n of the file's first pair; absent when its first page holds none. */
+      firstIndex?: number;
+      /**
+       * Set on a file larger than 1 MiB that cannot be read past its first page: upstream answered
+       * without byte ranges or a strong ETag to pin later pages to one version of the file.
+       */
+      firstMibOnly?: true;
+      /** Highest n among the pages of this version of the file read so far, this call's or cached. */
+      lastIndex?: number;
+      /** The n to ask for next when the file goes on past the last pair of `terms`. */
+      nextIndex?: number;
       /** Total file size when upstream stated it (`Content-Range` total or `Content-Length`). */
       sizeInBytes?: number;
+      /**
+       * Set when a line just before `terms[0]` is longer than the 4 KiB overlap between pages, so
+       * neither page holds it whole and it was skipped.
+       */
+      skippedLine?: true;
       status: 'ok';
-      /** Parsed pairs in file order; `#` comments and non-matching lines skipped. */
+      /**
+       * Pairs of the page holding `fromIndex` (the first page when it is unset), in file order; `#`
+       * comments and non-matching lines skipped. Empty when `unreached`.
+       */
       terms: BFileTerm[];
+      /**
+       * Set when the page reads one call may make did not reach `fromIndex`; the pages read are
+       * cached, so a later call starts closer.
+       */
+      unreached?: true;
     }
   /** The entry has no b-file: a `404`, or a file OEIS synthesized from the data line. */
   | { status: 'missing' };
@@ -147,4 +183,10 @@ export type BFileRead =
 export interface UpstreamCallOptions {
   /** Total wall-clock budget for this call's attempts, backoffs, and queue wait. Default 50 s. */
   deadlineMs?: number;
+}
+
+/** Options for {@link BFileRead} retrieval. */
+export interface BFileOptions extends UpstreamCallOptions {
+  /** The n the caller starts from; a file larger than 1 MiB is read at the page that holds it. */
+  fromIndex?: number | undefined;
 }

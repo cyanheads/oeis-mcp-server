@@ -89,12 +89,18 @@ export function offsetLine(offset: string | undefined, firstIndex: number | unde
     : `**Offset:** ${inline(offset)} (first term is a(${firstIndex}))`;
 }
 
-/** Renders the detail lines of one summary row (terms, offset, keywords, URL). */
+/**
+ * Renders the detail lines of one summary row: terms, offset, keywords, then the author, legacy IDs,
+ * and last edit when the row carries them, then the URL.
+ */
 export function summaryLines(row: z.infer<typeof SequenceSummarySchema>): string[] {
   return [
     `**Terms:** ${row.terms.length ? inline(row.terms.join(', ')) : 'none listed'}`,
     offsetLine(row.offset, row.firstIndex),
     `**Keywords:** ${row.keywords.length ? inline(row.keywords.join(', ')) : 'none'}`,
+    ...(row.author ? [`**Author:** ${inline(row.author)}`] : []),
+    ...(row.legacyIds ? [`**Legacy IDs:** ${inline(row.legacyIds.join(', '))}`] : []),
+    ...(row.modified ? [`**Modified:** ${inline(row.modified)}`] : []),
     `**URL:** ${row.url}`,
   ];
 }
