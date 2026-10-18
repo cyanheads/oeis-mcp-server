@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-10-18
+
+oeis_search_sequences says when OEIS split numbers into separate searches, oeis_get_terms revalidates a cached no-b-file answer, counts malformed b-file lines, and serves a limit above 1000 at 1000, and content[] shows contributor text as code.
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-10-02
 
 oeis_get_terms reads b-file terms past the first 1 MiB, oeis_get_sequence pages section selections past its response budget, and summary rows carry author, last edit, and legacy IDs.

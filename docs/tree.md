@@ -1,6 +1,6 @@
 # oeis-mcp-server - Directory Structure
 
-Generated on: 2026-10-02 05:14:14
+Generated on: 2026-10-18 05:28:41
 
 ```text
 oeis-mcp-server/
@@ -130,6 +130,7 @@ oeis-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
@@ -166,6 +167,7 @@ oeis-mcp-server/
 │   │   ├── a000108-record.ts
 │   │   ├── cpu-time.ts
 │   │   ├── oeis-upstream.ts
+│   │   ├── rendered-markdown.ts
 │   │   ├── scripted-fetch.ts
 │   │   └── tool-service.ts
 │   ├── resources/
