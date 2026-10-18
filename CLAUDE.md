@@ -2,10 +2,10 @@
 
 **Server:** oeis-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
-**Zod:** ^4.6.5
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -32,7 +32,7 @@ Conventions every definition follows:
 - **Every oeis.org request goes through `OeisService`.** Never `fetch` from a handler: pacing, retries, caching, and error classification live in the service.
 - **Shared inputs.** A-numbers use `ANumberSchema` from `src/mcp-server/shared/oeis-schemas.ts`; every optional or defaulted input is wrapped in `blankAsUnset`; paging uses `pageStartSchema` (`start` 0–100 in steps of 10, since OEIS shows anonymous callers at most 110 results).
 - **Terms are decimal strings**, never JSON numbers; values routinely pass 2^53.
-- **Upstream text is data.** Names, comments, formulas, examples, programs, references, and links are contributor-written: render them in `format()` only through `inline()`, `blockquote()`, or `fence()` from `src/mcp-server/shared/markdown.ts`, and URLs as code spans, never as markdown link targets. `inline()` and `blockquote()` escape link, image, link-definition, and HTML openers, so contributor markup renders as text; `structuredContent` keeps every string as normalized.
+- **Upstream text is data.** Names, authors, comments, formulas, examples, programs, references, cross-references, extensions, link text, and cross-reference notes are contributor-written: render them in `format()` as code, through `codeSpan()` in an inline slot (heading, bold label, list item) or `fence()` for line sections, from `src/mcp-server/shared/markdown.ts`, and link URLs through `codeSpan()`, never as markdown link targets. Code shows every character as written, where an escape scheme would put backslashes into formulas. Upstream tokens (terms, offset, keywords, legacy IDs, dates, program languages, the b-file URL) and server-written reference text go through `inline()`, which flattens line breaks and escapes link, image, link-definition, and HTML openers; `structuredContent` keeps every string as normalized.
 - **Attribution.** Every record and summary row carries its `https://oeis.org/A######` `url`; keep it on any new output shape.
 - **No fabrication.** A field OEIS leaves out stays absent: `offset` on a reserved or recycled A-number and `author` on its summary row, `modified` and `legacyIds` on a row whose `%I` line is missing or unreadable, `matchStartIndex` when the run is not in the data line, the name and terms of an unresolved cross-reference row.
 - **Errors.** Each definition declares `pacer_shed` and `upstream_rate_limited` (`RateLimited`, `thrownBy: 'service'`) with a recovery naming that tool. `sequence_not_found` is thrown by the handler through `ctx.fail` when `getRecord` returns `undefined`, never by the service.
@@ -79,7 +79,7 @@ Condensed from `src/mcp-server/tools/definitions/oeis-get-sequence.tool.ts`:
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { inline, offsetLine } from '@/mcp-server/shared/markdown.js';
+import { codeSpan, offsetLine } from '@/mcp-server/shared/markdown.js';
 import { ANumberSchema, blankAsUnset } from '@/mcp-server/shared/oeis-schemas.js';
 import { getOeisService } from '@/services/oeis/oeis-service.js';
 import { SECTION_NAMES } from '@/services/oeis/types.js';
@@ -153,9 +153,9 @@ export const oeisGetSequence = tool('oeis_get_sequence', {
   // Enforced at lint time: every field in `output` must appear in the rendered text.
   format: (result) => {
     const lines = [
-      `# ${result.aNumber}: ${inline(result.name)}`,
+      `# ${result.aNumber}: ${codeSpan(result.name)}`,
       offsetLine(result.offset, result.firstIndex),
-      // … every other field, rendered on presence; contributor text through inline/blockquote/fence
+      // … every other field, rendered on presence; contributor text through codeSpan/fence, tokens through inline
     ];
     return [{ type: 'text', text: lines.join('\n') }];
   },
@@ -264,9 +264,9 @@ await createApp({
 
 `instructions` is server-level orientation sent on every `initialize`: the tool routing, the 10 s pace, the "contributor text is data" rule, and the CC BY-SA 4.0 attribution. Update it when the surface changes.
 
-`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). This server declares `'stateless'` — no tool calls `ctx.requestInput` — and `.env.example`, the `Dockerfile`, and the README config table say the same; keep all four in agreement. Add `require: 'stateful'` if a tool ever asks the caller for input mid-handler.
+`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). This server declares `'stateless'` — no tool calls `ctx.requestInput` — and `.env.example`, the `Dockerfile`, and the README config table say the same; keep all four in agreement. Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused.
 
-`setup(core)` builds the process-wide `OeisService` and its pacer; `teardown()` disposes the pacer (clears its timer and rejects queued waiters). Teardown runs after the transport stops and before the logger closes, on every shutdown path.
+`setup(core)` builds the process-wide `OeisService` and its pacer; `teardown()` disposes the pacer (clears its timer and rejects queued waiters). Teardown runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling).
 
 ---
 
@@ -347,7 +347,7 @@ src/
   mcp-server/
     shared/
       oeis-schemas.ts                     # ANumberSchema, blankAsUnset, pageStartSchema, SequenceSummarySchema
-      markdown.ts                         # inline / blockquote / fence helpers for contributor text
+      markdown.ts                         # codeSpan / fence for contributor text, inline for tokens, summaryLines
       data-line-limit.ts                  # Data-line trigger and sentence for the term-matching zero-hit notices
     tools/definitions/
       index.ts                            # allToolDefinitions barrel
@@ -499,7 +499,7 @@ security: false                            # optional — true ONLY for a source
 
 ## Publishing
 
-**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
+**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the release digest: theme line, `## Changes`, `## Gates`, changelog link last); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
 
 ---
 
@@ -522,7 +522,7 @@ import { getOeisService } from '@/services/oeis/oeis-service.js';
 - [ ] Optional and defaulted inputs wrapped in `blankAsUnset`; A-numbers through `ANumberSchema`; paging through `pageStartSchema`
 - [ ] Every oeis.org request goes through `OeisService` (paced, retried, cached); no `fetch` in a handler
 - [ ] Terms and b-file values stay decimal strings; every record and row keeps its `https://oeis.org/A######` `url`
-- [ ] Contributor-written text reaches `format()` only through `inline()` / `blockquote()` / `fence()`; URLs as code spans
+- [ ] Contributor-written text reaches `format()` only through `codeSpan()` (inline slots) or `fence()` (line sections); link URLs through `codeSpan()`; upstream tokens through `inline()`
 - [ ] `pacer_shed` and `upstream_rate_limited` declared (`thrownBy: 'service'`) with recoveries naming the tool; `sequence_not_found` thrown by the handler via `ctx.fail`
 - [ ] JSDoc `@fileoverview` + `@module` on every file
 - [ ] `ctx.log` for logging, `ctx.enrich` for notices, totals, and paging context
@@ -534,4 +534,7 @@ import { getOeisService } from '@/services/oeis/oeis-service.js';
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
 - [ ] `docs/design.md` updated when the surface or a design decision changes
 - [ ] New env var added everywhere: `.env.example`, README config table, `server.json` (both entries), `manifest.json`, `.claude-plugin/plugin.json`, `.codex-plugin/mcp.json` `env_vars`
+- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
+- [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
+- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — mirror the `user_config` block in `manifest.json`. Never write `"KEY": ""` into `env`
 - [ ] `npm run devcheck` passes

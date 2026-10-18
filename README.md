@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oeis-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oeis-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oeis-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oeis-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oeis-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oeis-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Integer sequences from the [On-Line Encyclopedia of Integer Sequences](https://oeis.org/) (OEIS). Identify a sequence from a few observed terms, search with OEIS's own query syntax, read an entry's formulas and programs, page through extended terms from its b-file, and walk its cross-references. Every result links to its oeis.org page. Runs without an API key, as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Integer sequences from the [On-Line Encyclopedia of Integer Sequences](https://oeis.org/) (OEIS). Identify a sequence from a few observed terms, search with OEIS's own query syntax, read an entry's formulas and programs, page through extended terms from its b-file, and walk its cross-references. Every result links to its oeis.org page. No API key required.
 
 ### Tools
 
@@ -65,7 +65,8 @@ The same record is available through `oeis_get_sequence` for clients that only c
 - `query` (1–1,000 characters) is sent as written: words, `"quoted phrases"`, term lists, prefixes such as `keyword:`, `author:`, `name:`, `formula:`, `xref:`, and `id:`, `|` for OR, and a leading `-` to exclude
 - `sort`: `relevance` (default), `number`, `created`, or `modified`; 10 per page, `start` 0–100 in steps of 10
 - Rows carry `name`, `terms`, `offset` / `firstIndex`, `keywords`, `author`, `legacyIds`, `modified` (the last edit, ISO 8601 with offset), and `url`, in `oeis_get_sequence`'s formats; `author` and `legacyIds` are absent where OEIS has none
-- Reports `totalCount` and `effectiveQuery`, the query as OEIS parsed it. A query OEIS parses as one run of terms (`effectiveQuery` reads `seq:` or `signed:` and the terms, as for bare numbers) is matched within each entry's data line, as in `oeis_identify_sequence`, and its zero-hit notice names that limit under the same conditions
+- Reports `totalCount` and `effectiveQuery`, the query as OEIS parsed it. A query OEIS parses as one run of terms (`effectiveQuery` reads `seq:` or `signed:` and the terms, as for bare numbers separated by commas) is matched within each entry's data line, as in `oeis_identify_sequence`, and its zero-hit notice names that limit under the same conditions
+- With spaces alone between numbers, OEIS starts a new run at a negative term after the first and does not join fewer than three numbers; when `effectiveQuery` shows that split, the notice says so and gives the terms joined by commas to search as one run
 
 ---
 
@@ -80,9 +81,10 @@ The same record is available through `oeis_get_sequence` for clients that only c
 
 ### `oeis_get_terms` <sub>tool</sub>
 
-- `fromIndex` (default: the first available index) and `limit` 1–1,000 (default 100); a slice also stops at about 100,000 bytes or at the end of a 1 MiB part of the b-file, and `nextFromIndex` continues it
+- `fromIndex` (default: the first available index) and `limit` (default 100; one call returns at most 1,000 terms, so a larger `limit` is served as 1,000); a slice also stops at about 100,000 bytes or at the end of a 1 MiB part of the b-file, and `nextFromIndex` continues it
 - `source: "bfile"` reads the entry's b-file in 1 MiB parts, so a `fromIndex` past the first 1 MiB costs one or two more paced requests; `bFileCut: true` means the file goes on past `lastAvailableIndex`. `source: "data"` means the entry has no b-file and the terms are its data line
 - Terms come back as `{ n, value }`, `value` an exact decimal string; an unknown A-number fails as `sequence_not_found`
+- A b-file line that is not blank, a `#` comment, or an `n a(n)` pair is skipped, and the `notice` says how many; a b-file that holds no pair at all fails as `upstream_unparseable` and is not cached
 
 ---
 
@@ -120,13 +122,13 @@ OEIS-specific:
 Agent-friendly output:
 
 - Paging context on every page (`truncated`, `shown`, `cap`, plus `totalCount` and `effectiveQuery` where OEIS reports them) and a `notice` that says how to narrow or continue
-- Typed failures with recovery hints: `sequence_not_found`, `from_item_not_selected`, `pacer_shed`, and `upstream_rate_limited`, the rate-limit errors carrying `retryAfter` when one is known
+- Typed failures with recovery hints: `sequence_not_found`, `from_item_not_selected`, `upstream_unparseable`, `pacer_shed`, and `upstream_rate_limited`, the rate-limit errors carrying `retryAfter` when one is known
 - Discriminated outputs (`kind`, `source`, per-row `resolved`), so callers branch on data, not string parsing
-- Every record and row carries its `https://oeis.org/A######` URL; contributor-written text renders as blockquotes and code fences, and only `http` and `https` link URLs are kept
+- Every record and row carries its `https://oeis.org/A######` URL; contributor-written text renders as code spans and code fences, so a markdown client shows formulas and names exactly as written, and only `http` and `https` link URLs are kept
 
 ## Pacing and caching
 
-oeis.org asks automated clients to wait 10 seconds between requests. The server sends one upstream request at a time and starts each at least 10 seconds after the last, across every tool. Results are cached in memory, so a repeated lookup returns at once and costs oeis.org nothing: records for 24 hours, or until a search result shows a later edit (then revalidated with a conditional request), search pages for 1 hour, and b-file parts for 7 days.
+oeis.org asks automated clients to wait 10 seconds between requests. The server sends one upstream request at a time and starts each at least 10 seconds after the last, across every tool. Results are cached in memory, so a repeated lookup returns at once and costs oeis.org nothing: records for 24 hours, or until a search result shows a later edit (then revalidated with a conditional request), search pages for 1 hour, and b-file parts for 7 days. An entry's cached "no b-file" answer is dropped as soon as a fetched record lists a b-file.
 
 A call with nothing cached waits its turn in the queue. When the wait would pass `OEIS_QUEUE_MAX_WAIT_MS` (default 30,000 ms), the call fails with `pacer_shed` and a `retryAfter` instead of hanging. If oeis.org answers 429, the server holds every queued call back before trying again, and reports `upstream_rate_limited` once its retries are spent. The pace is per server process.
 
