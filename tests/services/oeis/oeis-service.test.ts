@@ -17,12 +17,14 @@ import {
   initOeisService,
   OeisService,
 } from '@/services/oeis/oeis-service.js';
+import { cpuMsAsync } from '../../fixtures/cpu-time.js';
 import {
   bFileText,
   capturedSearchRecords,
   FIBONACCI_LAST_MODIFIED,
   fibonacciBFile,
   fibonacciRecordJson,
+  fixedWidthBFile,
   htmlMaintenanceBody,
   LUCAS_ETAG,
   longLineBFile,
@@ -270,6 +272,69 @@ describe('OeisService.getRecord', () => {
         data: { reason: 'upstream_unparseable' },
       });
       expect(h.fetchCalls).toHaveLength(1);
+    });
+  });
+
+  describe('a cached b-file miss', () => {
+    const notFound = res('<html>Not found</html>', { status: 404 });
+    const paths = (h: Harness) => h.fetchCalls.map((call) => new URL(call.url).pathname);
+
+    it.each([
+      ['a 404', notFound],
+      ['a synthesized file', res(synthesizedBFile('A000045', ['0', '1', '1']), { status: 200 })],
+    ])(
+      'is dropped when a fetched record lists the b-file, after %s, so the next read requests it',
+      async (_label, miss) => {
+        const h = harness([miss, json(), res(fibonacciBFile, { status: 200 })]);
+        await expect(h.service.getBFile('A000045', h.ctx)).resolves.toEqual({ status: 'missing' });
+        const record = await h.service.getRecord('A000045', h.ctx);
+        expect(record?.bFileUrl).toBe(BFILE_URL);
+        await expect(h.service.getBFile('A000045', h.ctx)).resolves.toMatchObject({
+          status: 'ok',
+          lastIndex: 14,
+        });
+        expect(paths(h)).toEqual(['/A000045/b000045.txt', '/A000045', '/A000045/b000045.txt']);
+      },
+    );
+
+    it('is dropped when a 304 revalidates a cached record that lists the b-file', async () => {
+      const h = harness([json(), notFound, res(null, { status: 304 }), res(fibonacciBFile)]);
+      await h.service.getRecord('A000045', h.ctx);
+      await expect(h.service.getBFile('A000045', h.ctx)).resolves.toEqual({ status: 'missing' });
+      h.clock.now += DAY;
+      await h.service.getRecord('A000045', h.ctx);
+      expect(h.fetchCalls[2]?.headers.get('if-modified-since')).toBe(FIBONACCI_LAST_MODIFIED);
+      await expect(h.service.getBFile('A000045', h.ctx)).resolves.toMatchObject({ status: 'ok' });
+      expect(h.fetchCalls).toHaveLength(4);
+    });
+
+    it('stands when the record fetched or revalidated lists no b-file', async () => {
+      const h = harness([notFound, json(minimalRecordJson), res(null, { status: 304 })]);
+      await h.service.getBFile('A388000', h.ctx);
+      await h.service.getRecord('A388000', h.ctx);
+      await expect(h.service.getBFile('A388000', h.ctx)).resolves.toEqual({ status: 'missing' });
+      h.clock.now += DAY;
+      await h.service.getRecord('A388000', h.ctx);
+      await expect(h.service.getBFile('A388000', h.ctx)).resolves.toEqual({ status: 'missing' });
+      expect(paths(h)).toEqual(['/A388000/b388000.txt', '/A388000', '/A388000']);
+    });
+
+    it('stands while the record is served from cache, which fetches and revalidates nothing', async () => {
+      const h = harness([json(), notFound]);
+      await h.service.getRecord('A000045', h.ctx);
+      await h.service.getBFile('A000045', h.ctx);
+      await h.service.getRecord('A000045', h.ctx);
+      await expect(h.service.getBFile('A000045', h.ctx)).resolves.toEqual({ status: 'missing' });
+      expect(h.fetchCalls).toHaveLength(2);
+    });
+
+    it('is the only b-file read a record drops: a cached file stays', async () => {
+      // The third step, a different file, answers only if the record dropped the cached one.
+      const h = harness([res(fibonacciBFile, { status: 200 }), json(), res(bFileText(['9', '9']))]);
+      const file = await h.service.getBFile('A000045', h.ctx);
+      await h.service.getRecord('A000045', h.ctx);
+      expect(await h.service.getBFile('A000045', h.ctx)).toBe(file);
+      expect(h.fetchCalls).toHaveLength(2);
     });
   });
 
@@ -1004,7 +1069,7 @@ describe('OeisService.getBFile', () => {
     expect(cancelled).toBe(true);
   });
 
-  it('skips comments, blank lines and malformed lines, and reads CRLF, negatives and big values', async () => {
+  it('skips comments, blank lines and malformed lines, counting the malformed ones, and reads CRLF, negatives and big values', async () => {
     const body = [
       '# comment',
       '',
@@ -1025,15 +1090,40 @@ describe('OeisService.getBFile', () => {
       { n: 2, value: '123456789012345678901234567890' },
       { n: -1, value: '7' },
     ]);
+    expect(read.malformedLines).toBe(4);
   });
 
-  it('reads an empty 200 body as no terms', async () => {
-    const h = harness([res('', { status: 200 })]);
-    await expect(h.service.getBFile('A000045', ctx)).resolves.toMatchObject({
-      status: 'ok',
-      terms: [],
-      cut: false,
-    });
+  it('counts only lines that are neither blank, a comment, nor a pair as malformed', async () => {
+    const body = [
+      '# Table of n, a(n) for n = 0..9',
+      '   ',
+      '\t',
+      '\r',
+      '  # an indented comment',
+      '0\t0',
+      '1  \t  1',
+      '  2 1  ',
+      '3 2\r',
+      '-4 3',
+      '5 -5',
+      '6 123456789012345678901234567890123',
+      '9007199254740991 8',
+      '7 13',
+      '',
+    ].join('\n');
+    const h = harness([res(body, { status: 200 })]);
+    const read = await h.service.getBFile('A000045', ctx);
+    if (read.status !== 'ok') throw new Error('expected ok');
+    expect(read.terms.map((term) => term.n)).toEqual([0, 1, 2, 3, -4, 5, 6, 9007199254740991]);
+    // The one line whose separator is neither a space nor a tab: n = 7 is followed by U+00A0.
+    expect(read.malformedLines).toBe(1);
+  });
+
+  it('reads a first page with no pairs as ok when the read was cut, and counts nothing in the cut-off line', async () => {
+    const h = harness([partial('# a header\n0 x', 429_385)]);
+    const read = await h.service.getBFile('A000045', ctx);
+    expect(read).toMatchObject({ status: 'ok', terms: [], cut: true, sizeInBytes: 429_385 });
+    expect(read).not.toHaveProperty('malformedLines');
   });
 
   describe('404 and caching', () => {
@@ -1115,6 +1205,32 @@ describe('OeisService.getBFile', () => {
       await caught(withBackoff(h.service.getBFile('A000045', ctx)));
       await expect(h.service.getBFile('A000045', ctx)).resolves.toMatchObject({ status: 'ok' });
     });
+
+    it.each([
+      ['a text body', 'Temporarily unavailable. Please retry later.\n'],
+      ['an empty body', ''],
+      ['a comments-only body', '# Table of n, a(n)\n# nothing yet\n'],
+      ['a body of blank lines', '\n \r\n\t\n'],
+      ['a 206 read whole', '# none\n'],
+    ])(
+      'fails %s with no pair, read whole, as retryable upstream_unparseable and caches nothing',
+      async (label, body) => {
+        const step =
+          label === 'a 206 read whole'
+            ? partial(body, body.length)
+            : res(body, { status: 200, headers: { 'content-type': 'text/plain' } });
+        const h = harness([step, step, step, res(fibonacciBFile, { status: 200 })]);
+        const error = await caught(withBackoff(h.service.getBFile('A000045', ctx)));
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          data: { reason: 'upstream_unparseable', retryAttempts: 3 },
+        });
+        expect(error.data).not.toHaveProperty('retryable');
+        expect(h.fetchCalls).toHaveLength(3);
+        await expect(h.service.getBFile('A000045', ctx)).resolves.toMatchObject({ status: 'ok' });
+        expect(h.fetchCalls).toHaveLength(4);
+      },
+    );
 
     it('maps an edge 403 on the b-file path to upstream_refused', async () => {
       const h = harness([res('blocked', { status: 403 })]);
@@ -1218,6 +1334,58 @@ describe('OeisService.getBFile past the first 1 MiB', () => {
     expect(read.terms[0]).toEqual({ n: 86_764, value: sigmaOf(86_764) });
     expect(read.terms.some((pair) => pair.n === 6_763)).toBe(false);
     expectSigmaRun(read.terms);
+  });
+
+  it("counts a page's malformed lines on the reads it answers, never the first page's cut-off line or a later page's first line", async () => {
+    const body = fixedWidthBFile([100, 39_000]);
+    const h = harness([rangedFile({ body, etag: '"fixed"' }).step]);
+
+    const head = ok(await h.service.getBFile('A000001', h.ctx));
+    expect(head).toMatchObject({ malformedLines: 1, lastIndex: 37_448, nextIndex: 37_449 });
+    expect(head.terms.some((pair) => pair.n === 100)).toBe(false);
+
+    const later = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: 39_500 }));
+    expect(later).toMatchObject({ malformedLines: 1, lastIndex: 39_999, cut: false });
+    expect(later.terms[0]?.n).toBe(37_303);
+    expect(later.terms.some((pair) => pair.n === 39_000)).toBe(false);
+    expect(h.fetchCalls.map((call) => call.headers.get('range'))).toEqual([
+      'bytes=0-1048575',
+      'bytes=1044480-1119999',
+    ]);
+
+    const again = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: 39_500 }));
+    expect(again.malformedLines).toBe(1);
+    expect(ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: 10 })).malformedLines).toBe(
+      1,
+    );
+    expect(h.fetchCalls).toHaveLength(2);
+  });
+
+  it('carries no malformed count on a read from a page that has none', async () => {
+    const h = harness([rangedFile({ body: fixedWidthBFile([39_000]), etag: '"fixed"' }).step]);
+    const later = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: 39_500 }));
+    expect(later.malformedLines).toBe(1);
+    const head = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: 10 }));
+    expect(head.terms[0]).toEqual({ n: 0, value: '7'.repeat(20) });
+    expect(head).not.toHaveProperty('malformedLines');
+    expect(h.fetchCalls).toHaveLength(2);
+  });
+
+  it('counts a malformed line in the overlap on both pages, and one a page edge cuts only on the page holding it whole', async () => {
+    // n = 37302 is whole only in page 0 (page 1 opens inside it), 37400 lies in the 4 KiB both
+    // pages hold, and 37449 is whole only in page 1 (page 0 ends inside it).
+    const junk = [37_302, 37_400, 37_449];
+    const h = harness([rangedFile({ body: fixedWidthBFile(junk), etag: '"fixed"' }).step]);
+
+    const head = ok(await h.service.getBFile('A000001', h.ctx));
+    expect(head).toMatchObject({ malformedLines: 2, lastIndex: 37_448 });
+    const later = ok(await h.service.getBFile('A000001', h.ctx, { fromIndex: 39_500 }));
+    expect(later).toMatchObject({ malformedLines: 2, lastIndex: 39_999 });
+    expect(later.terms[0]?.n).toBe(37_303);
+    for (const read of [head, later]) {
+      expect(read.terms.filter((pair) => junk.includes(pair.n))).toEqual([]);
+    }
+    expect(h.fetchCalls).toHaveLength(2);
   });
 
   it('stops after two page reads with unreached, and the next call reads on from the pages cached', async () => {
@@ -1595,6 +1763,90 @@ describe('OeisService.getBFile past the first 1 MiB', () => {
           }
         },
       );
+    });
+  });
+
+  describe('line grammar in time linear in the line length', () => {
+    const SAMPLES = 3;
+    /** Thread CPU ms one read may take at any size: far above linear cost, far below quadratic. */
+    const BOUND_MS = 250;
+    // The digit run carries the full 64× span; the other shapes stay under Bun's ~80k regex switch.
+    const shapes: [string, (size: number) => string, number, number][] = [
+      [
+        'a digit run no second number follows',
+        (size) => `1 ${'9'.repeat(size)} x\n`,
+        5_000,
+        320_000,
+      ],
+      [
+        'a run of spaces and tabs after n',
+        (size) => `1${' \t'.repeat(size / 2)}x\n`,
+        1_000,
+        64_000,
+      ],
+      [
+        'trailing spaces before a stray character',
+        (size) => `1 2${' '.repeat(size)}x\n`,
+        1_000,
+        64_000,
+      ],
+      [
+        'leading spaces before a stray character',
+        (size) => `${' '.repeat(size)}x\n`,
+        1_000,
+        64_000,
+      ],
+      [
+        'one long line, then a line break',
+        (size) => `${'§1 x'.repeat(size / 4)}\ny`,
+        1_000,
+        64_000,
+      ],
+      [
+        'line breaks interleaved with blank space, between two stray characters',
+        (size) => `x\n${'  \r\n'.repeat(size / 4)}x\n`,
+        1_000,
+        64_000,
+      ],
+      ['many short malformed lines', (size) => '1 x\n'.repeat(size / 4), 1_000, 64_000],
+    ];
+
+    it.each(shapes)('reads %s', async (_label, shape, from, to) => {
+      const bodies = new Map<string, string>();
+      const { fetch } = scriptedFetch(
+        (call) => new Response(bodies.get(/\/(A\d+)\//.exec(call.url)?.[1] ?? ''), { status: 200 }),
+      );
+      const service = new OeisService({ fetch, pacer: immediatePacer() });
+      const ctx = createMockContext();
+      let id = 1;
+      /** The fastest of SAMPLES first-page reads of one valid pair, then the shape at `size`. */
+      const fastest = async (size: number) => {
+        let best = Number.POSITIVE_INFINITY;
+        for (let sample = 0; sample < SAMPLES; sample++) {
+          const aNumber = `A${String(id++).padStart(6, '0')}`;
+          bodies.set(aNumber, `0 0\n${shape(size)}`);
+          let read: Awaited<ReturnType<OeisService['getBFile']>> | undefined;
+          best = Math.min(
+            best,
+            await cpuMsAsync(async () => {
+              read = await service.getBFile(aNumber, ctx);
+            }),
+          );
+          expect(read).toMatchObject({ status: 'ok', terms: [{ n: 0, value: '0' }] });
+          expect(read?.status === 'ok' && read.malformedLines).toBeGreaterThan(0);
+        }
+        return best;
+      };
+
+      const first = await fastest(from);
+      expect(first).toBeLessThan(BOUND_MS);
+      let last = first;
+      for (let size = from * 2; size <= to; size *= 2) {
+        last = await fastest(size);
+        expect(last).toBeLessThan(BOUND_MS);
+      }
+      // Linear growth keeps the ratio near the 64× span; quadratic growth would put it near 4096.
+      expect(last / first).toBeLessThan(256);
     });
   });
 

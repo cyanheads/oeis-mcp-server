@@ -404,6 +404,176 @@ export function syntheticSearchPage(options: {
   });
 }
 
+/** First records of the {@link echoCapturePage} pages, cut to the lines the parser reads, verbatim. */
+const echoCaptureRecords = {
+  A000045: [
+    '%I A000045 M0692 N0256 #2609 Oct 16 2026 16:43:09',
+    '%S A000045 0,1,1,2,3,5,8,13,21,34,55,89,144,233,377,610,987,1597,2584,4181,6765,',
+    '%T A000045 10946,17711,28657,46368,75025,121393,196418,317811,514229,832040,',
+    '%U A000045 1346269,2178309,3524578,5702887,9227465,14930352,24157817,39088169,63245986,102334155',
+    '%N A000045 Fibonacci numbers: F(n) = F(n-1) + F(n-2) with F(0) = 0 and F(1) = 1.',
+    '%K A000045 nonn,core,nice,easy,hear,changed',
+    '%O A000045 0,4',
+    '%A A000045 _N. J. A. Sloane_, 1964',
+  ].join('\n'),
+  A000108: [
+    '%I A000108 M1459 N0577 #2256 Oct 03 2026 09:50:18',
+    '%S A000108 1,1,2,5,14,42,132,429,1430,4862,16796,58786,208012,742900,2674440,',
+    '%T A000108 9694845,35357670,129644790,477638700,1767263190,6564120420,',
+    '%U A000108 24466267020,91482563640,343059613650,1289904147324,4861946401452,18367353072152,69533550916004,263747951750360,1002242216651368,3814986502092304',
+    '%N A000108 Catalan numbers: C(n) = binomial(2n,n)/(n+1) = (2n)!/(n!(n+1)!).',
+    '%K A000108 core,nonn,easy,eigen,nice',
+    '%O A000108 0,3',
+    '%A A000108 _N. J. A. Sloane_',
+  ].join('\n'),
+  A000203: [
+    '%I A000203 M2329 N0921 #648 Oct 14 2026 14:28:25',
+    '%S A000203 1,3,4,7,6,12,8,15,13,18,12,28,14,24,24,31,18,39,20,42,32,36,24,60,31,',
+    '%T A000203 42,40,56,30,72,32,63,48,54,48,91,38,60,56,90,42,96,44,84,78,72,48,',
+    '%U A000203 124,57,93,72,98,54,120,72,120,80,90,60,168,62,96,104,127,84,144,68,126,96,144',
+    '%N A000203 a(n) = sigma(n), the sum of the divisors of n. Also called sigma_1(n).',
+    '%K A000203 easy,core,nonn,nice,mult,changed',
+    '%O A000203 1,2',
+    '%A A000203 _N. J. A. Sloane_',
+  ].join('\n'),
+  A008683: [
+    '%I A008683 #413 Oct 04 2026 21:02:18',
+    '%S A008683 1,-1,-1,0,-1,1,-1,0,0,1,-1,0,-1,1,1,0,-1,0,-1,0,1,1,-1,0,0,1,0,0,-1,',
+    '%T A008683 -1,-1,0,1,1,1,0,-1,1,1,0,-1,-1,-1,0,0,1,-1,0,0,0,1,0,-1,0,1,0,1,1,-1,',
+    '%U A008683 0,-1,1,0,0,1,-1,-1,0,1,-1,-1,0,-1,1,0,0,1,-1',
+    '%N A008683 Möbius (or Moebius) function mu(n). mu(1) = 1; mu(n) = (-1)^k if n is the product of k different primes; otherwise mu(n) = 0.',
+    '%K A008683 core,sign,easy,mult,nice,changed',
+    '%O A008683 1,1',
+    '%A A008683 _N. J. A. Sloane_',
+  ].join('\n'),
+  A023900: [
+    '%I A023900 #249 Sep 24 2026 01:24:36',
+    '%S A023900 1,-1,-2,-1,-4,2,-6,-1,-2,4,-10,2,-12,6,8,-1,-16,2,-18,4,12,10,-22,2,',
+    '%T A023900 -4,12,-2,6,-28,-8,-30,-1,20,16,24,2,-36,18,24,4,-40,-12,-42,10,8,22,',
+    '%U A023900 -46,2,-6,4,32,12,-52,2,40,6,36,28,-58,-8,-60,30,12,-1,48,-20,-66,16,44,-24,-70,2,-72,36,8,18,60,-24,-78,4,-2',
+    '%N A023900 Dirichlet inverse of Euler totient function (A000010).',
+    '%K A023900 sign,easy,nice,mult',
+    '%O A023900 1,3',
+    '%A A023900 _Olivier Gérard_',
+  ].join('\n'),
+  A238442: [
+    '%I A238442 #91 Nov 05 2025 15:22:26',
+    '%S A238442 1,1,2,3,1,4,3,7,4,-5,6,7,-1,12,6,-3,-7,8,12,-4,-1,15,8,-7,-3,13,15,',
+    '%T A238442 -6,-4,18,13,-12,-7,12,18,-8,-6,12,28,12,-15,-12,1,14,28,-13,-8,3,24,',
+    '%U A238442 14,-18,-15,4,15,24,24,-12,-13,7,1,31,24,-28,-18,6,3',
+    "%N A238442 Triangle read by rows demonstrating Euler's pentagonal theorem for the sum of divisors.",
+    '%K A238442 sign,tabf',
+    '%O A238442 1,3',
+    '%A A238442 _Omar E. Pol_, Feb 26 2014',
+  ].join('\n'),
+  A370071: [
+    '%I A370071 #64 Mar 28 2024 00:01:03',
+    '%S A370071 0,1,8,144,610,46368,1346269,14930352,63245986,165580141,267914296,',
+    '%T A370071 2971215073,4807526976,7778742049,12586269025,139583862445,',
+    '%U A370071 365435296162,591286729879,956722026041,1548008755920,2504730781961,4052739537881,6557470319842,17167680177565,27777890035288,190392490709135',
+    '%N A370071 Fibonacci numbers such that some permutation of their digits is a perfect power.',
+    '%K A370071 nonn,base',
+    '%O A370071 1,3',
+    '%A A370071 _Gonzalo Martínez_, Feb 08 2024',
+  ].join('\n'),
+} as const;
+
+/**
+ * `/search?fmt=text` pages oeis.org served on 2026-10-18 for numbers separated by spaces, commas,
+ * or both, keyed by the query sent: the `Search:` echo and status line verbatim, and the A-number
+ * of the first record. OEIS joins three or more numbers into one `seq:` run, but with spaces alone
+ * a negative term after the first starts a new run and fewer than three numbers are not joined.
+ */
+const echoCaptures = {
+  '1 -1 -1 0 -1 1 -1 0 0 1': [
+    '1 seq:-1 seq:-1 0 seq:-1 1 seq:-1,0,0,1',
+    'Showing 1-10 of 7824',
+    'A008683',
+  ],
+  '1,-1,-1,0,-1,1,-1,0,0,1': ['seq:1,-1,-1,0,-1,1,-1,0,0,1', 'Showing 1-10 of 202', 'A008683'],
+  '1, -1, -1, 0, -1, 1, -1, 0, 0, 1': [
+    'seq:1,-1,-1,0,-1,1,-1,0,0,1',
+    'Showing 1-10 of 202',
+    'A008683',
+  ],
+  '1 2 5 14 42 132': ['seq:1,2,5,14,42,132', 'Showing 1-10 of 50', 'A000108'],
+  '5 14 42': ['seq:5,14,42', 'Showing 1-10 of 126', 'A000108'],
+  '-1 2 5 14 42 132': ['seq:-1,2,5,14,42,132', 'Showing 1-10 of 50', 'A000108'],
+  '1 2 -5 14 42 132': ['1 2 seq:-5,14,42,132', 'Showing 1-10 of 51', 'A000108'],
+  '-42': ['seq:-42', 'Showing 1-10 of 36344', 'A023900'],
+  '1,-1,-1,0 -1 1 -1 0 0 1': [
+    'seq:1,-1,-1,0 seq:-1 1 seq:-1,0,0,1',
+    'Showing 1-10 of 3558',
+    'A008683',
+  ],
+  'mobius 1 -1 -1 0 -1 1 -1 0 0 1': [
+    'mobius 1 seq:-1 seq:-1 0 seq:-1 1 seq:-1,0,0,1',
+    'Showing 1-10 of 175',
+    'A008683',
+  ],
+  'seq:1 -1 -1 0 -1 1 -1 0 0 1': [
+    'seq:1 seq:-1 seq:-1 0 seq:-1 1 seq:-1,0,0,1',
+    'Showing 1-10 of 7824',
+    'A008683',
+  ],
+  'signed:1 -1 -1 0 -1 1 -1 0 0 1': [
+    'signed:1 seq:-1 seq:-1 0 seq:-1 1 seq:-1,0,0,1',
+    'Showing 1-10 of 7814',
+    'A008683',
+  ],
+  '-6227020801 87178291200 -1307674368000 20922789888000': [
+    'seq:-6227020801 87178291200 seq:-1307674368000 20922789888000',
+    'No results.',
+  ],
+  '1 -1 1 -1': ['1 seq:-1 1 seq:-1', 'Too many results. Please narrow search.'],
+  '14 42': ['14 42', 'Showing 1-10 of 30017', 'A000203'],
+  'signed:1,-1,-1,0,-1,1,-1,0,0,1': [
+    'signed:1,-1,-1,0,-1,1,-1,0,0,1',
+    'Showing 1-10 of 12',
+    'A008683',
+  ],
+  '1 2 3 -5 6 7': ['seq:1,2,3 seq:-5,6,7', 'Showing 1-10 of 6967', 'A238442'],
+  '1 1 _ 3 5 8': ['seq:1,1,_,3,5,8', 'Showing 1-10 of 344', 'A000045'],
+  '1548008755920 _ 4052739537881 6557470319842': [
+    'seq:1548008755920,_,4052739537881,6557470319842',
+    'Showing 1-1 of 1',
+    'A370071',
+  ],
+  '190392490709135 _ 498454011879264 _ 1304969544928657': [
+    'seq:190392490709135,_,498454011879264,_,1304969544928657',
+    'No results.',
+  ],
+  '_ 1548008755920 2504730781961 4052739537881 6557470319842 10610209857723': [
+    'seq:1548008755920,2504730781961,4052739537881,6557470319842,10610209857723',
+    'No results.',
+  ],
+} as const satisfies Record<string, EchoCapture>;
+
+type EchoCapture = readonly [
+  echo: string,
+  status: string,
+  firstRecord?: keyof typeof echoCaptureRecords,
+];
+
+/** A query with a captured page in {@link echoCapturePage}. */
+export type EchoCaptureQuery = keyof typeof echoCaptures;
+
+/** The captured `Search:` echo of `query`. */
+export const capturedEcho = (query: EchoCaptureQuery): string => echoCaptures[query][0];
+
+/**
+ * The page oeis.org served for `query` on 2026-10-18: its echo, its status line, and its first
+ * record, then synthetic rows up to the row count the status line shows.
+ */
+export function echoCapturePage(query: EchoCaptureQuery): string {
+  const [echo, status, first]: EchoCapture = echoCaptures[query];
+  const [, from = '0', to = '0'] = /^Showing (\d+)-(\d+) of/.exec(status) ?? [];
+  const records = first
+    ? [echoCaptureRecords[first], ...syntheticSearchRecords(Number(to) - Number(from))]
+    : [];
+  return searchPageText({ query: echo, records, status });
+}
+
 /** What a Cloudflare or maintenance page serves in place of data. */
 export const htmlMaintenanceBody =
   '<!DOCTYPE html>\n<html lang="en"><head><title>Maintenance</title></head><body>Back soon.</body></html>\n';
@@ -582,6 +752,23 @@ export function trailingCommentsBFile(): { body: string; lastN: number } {
   }
   trailingComments = { body: lines.join(''), lastN: n - 1 };
   return trailingComments;
+}
+
+/**
+ * A two-page b-file of 28-byte lines (`000000 77777777777777777777\n`, n = 0..39999, 1,120,000
+ * bytes), with the line of each n in `junk` replaced by a 28-byte line that is not a pair
+ * (`039000 unavailable         `). The first 1 MiB ends 4 bytes into the line for n = 37449
+ * (`0374`), and the second page, from byte 1,044,480, opens on the last 3 bytes of the line for
+ * n = 37302 (`777`): both cut fragments are lone digit runs, so either would read as malformed.
+ */
+export function fixedWidthBFile(junk: readonly number[] = []): string {
+  const skip = new Set(junk);
+  const lines: string[] = [];
+  for (let n = 0; n < 40_000; n++) {
+    const value = skip.has(n) ? 'unavailable'.padEnd(20) : '7'.repeat(20);
+    lines.push(`${String(n).padStart(6, '0')} ${value}\n`);
+  }
+  return lines.join('');
 }
 
 /** A b-file body well past the 1 MiB read cap, built from variable-width lines. */

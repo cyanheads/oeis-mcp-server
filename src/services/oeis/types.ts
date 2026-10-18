@@ -155,6 +155,11 @@ export type BFileRead =
       firstMibOnly?: true;
       /** Highest n among the pages of this version of the file read so far, this call's or cached. */
       lastIndex?: number;
+      /**
+       * Whole lines of the page `terms` come from that are neither blank, a `#` comment, nor an
+       * `n a(n)` pair; they were skipped. Absent when there are none.
+       */
+      malformedLines?: number;
       /** The n to ask for next when the file goes on past the last pair of `terms`. */
       nextIndex?: number;
       /** Total file size when upstream stated it (`Content-Range` total or `Content-Length`). */
@@ -166,8 +171,8 @@ export type BFileRead =
       skippedLine?: true;
       status: 'ok';
       /**
-       * Pairs of the page holding `fromIndex` (the first page when it is unset), in file order; `#`
-       * comments and non-matching lines skipped. Empty when `unreached`.
+       * Pairs of the page holding `fromIndex` (the first page when it is unset), in file order;
+       * blank lines, `#` comments, and malformed lines skipped. Empty when `unreached`.
        */
       terms: BFileTerm[];
       /**

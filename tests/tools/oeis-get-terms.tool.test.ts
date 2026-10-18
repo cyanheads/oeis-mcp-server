@@ -10,6 +10,7 @@
  * @module tests/tools/oeis-get-terms.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { createPacer } from '@cyanheads/mcp-ts-core/utils';
@@ -20,6 +21,7 @@ import {
   bFileText,
   fibonacciBFile,
   fibonacciRecordJson,
+  fixedWidthBFile,
   htmlMaintenanceBody,
   longLineBFile,
   minimalRecordJson,
@@ -29,6 +31,7 @@ import {
   recordWith,
   reservedRecordJson,
   SIGMA_ETAG,
+  searchPageText,
   sigmaBFile,
   sigmaOf,
   steppedBFile,
@@ -129,15 +132,50 @@ describe('oeis_get_terms', () => {
       expect(oeisGetTerms.input.parse({ aNumber: 'A45', limit }).limit).toBe(limit);
     });
 
+    it.each([1001, 5000, Number.MAX_SAFE_INTEGER])(
+      'accepts limit %i past the 1000-term cap, unclamped by the schema',
+      (limit) => {
+        expect(oeisGetTerms.input.parse({ aNumber: 'A45', limit }).limit).toBe(limit);
+      },
+    );
+
     it.each([
       ['zero', 0],
       ['negative', -1],
-      ['past the cap', 1001],
+      ['past the safe-integer bound', Number.MAX_SAFE_INTEGER + 1],
       ['fractional', 10.5],
       ['a numeric string', '50'],
       ['null', null],
     ])('rejects limit that is %s', (_label, limit) => {
       expect(oeisGetTerms.input.safeParse({ aNumber: 'A45', limit }).success).toBe(false);
+    });
+
+    it.each([0, -1, 10.5, Number.MAX_SAFE_INTEGER + 1])(
+      'answers limit %d with invalid_arguments and no request',
+      async (limit) => {
+        const { calls, result } = await getTerms({ aNumber: 'A45', limit }, bFile(fibonacciBFile));
+        expect(result.isError).toBe(true);
+        expect(errorOf(result)).toMatchObject({
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason: 'invalid_arguments' },
+        });
+        expect(errorOf(result).message).toContain('limit');
+        expect(calls).toHaveLength(0);
+      },
+    );
+
+    it('advertises limit as a positive integer with the safe-integer bound as its only ceiling', () => {
+      const limit = z.toJSONSchema(oeisGetTerms.input, { io: 'input', unrepresentable: 'any' })
+        .properties?.limit;
+      expect(limit).toMatchObject({
+        type: 'integer',
+        minimum: 1,
+        maximum: Number.MAX_SAFE_INTEGER,
+        default: 100,
+      });
+      expect(oeisGetTerms.input.shape.limit.description).toContain(
+        'One call returns at most 1000, so a larger limit is served as 1000.',
+      );
     });
 
     it.each([0, 5, -3, 100_000])('accepts the integer fromIndex %i', (fromIndex) => {
@@ -263,6 +301,32 @@ describe('oeis_get_terms', () => {
         { n: 2, value: '30' },
         { n: 4, value: '-50' },
       ]);
+      expect(structured(result).notice).toBe(
+        `The part of the b-file this slice comes from has 4 lines that are not n a(n) pairs; they were skipped, so terms may be missing. The file is at ${FIB_BFILE_URL}.`,
+      );
+    });
+
+    it('serves the pairs around a malformed line with a notice that names it, from cache on a repeat', async () => {
+      const { service, calls } = serviceOver(bFile('0 0\n1 1\n2 unavailable\n3 2\n'));
+      holder.service = service;
+      const notice = `The part of the b-file this slice comes from has 1 line that is not an n a(n) pair; it was skipped, so a term may be missing. The file is at ${FIB_BFILE_URL}.`;
+      for (let call = 0; call < 2; call++) {
+        const result = await runToolContract(oeisGetTerms, { aNumber: 'A000045' });
+        expect(result.isError).toBeUndefined();
+        expect(terms(result)).toEqual([
+          { n: 0, value: '0' },
+          { n: 1, value: '1' },
+          { n: 3, value: '2' },
+        ]);
+        expect(structured(result)).toMatchObject({
+          source: 'bfile',
+          lastAvailableIndex: 3,
+          truncated: false,
+          notice,
+        });
+        expect(textOf(result)).toContain(notice);
+      }
+      expect(calls).toHaveLength(1);
     });
 
     it('serves a 206 b-file whole and reports the size from Content-Range', async () => {
@@ -658,6 +722,38 @@ describe('oeis_get_terms', () => {
       expect(calls).toHaveLength(2);
     });
 
+    it('names a malformed line in a later part on every slice from that part, and on none from the first', async () => {
+      const file = rangedFile({ body: fixedWidthBFile([39_000]), etag: '"fixed"' });
+      const { service, calls } = serviceOver(file.step);
+      holder.service = service;
+      const skipped =
+        'The part of the b-file this slice comes from has 1 line that is not an n a(n) pair; it was skipped, so a term may be missing. The file is at https://oeis.org/A000001/b000001.txt.';
+      const seven = (n: number) => ({ n, value: '7'.repeat(20) });
+
+      for (const [fromIndex, served, next] of [
+        [38_998, [38_998, 38_999, 39_001], 39_002],
+        [39_500, [39_500, 39_501, 39_502], 39_503],
+      ] as const) {
+        const later = await runToolContract(oeisGetTerms, {
+          aNumber: 'A000001',
+          fromIndex,
+          limit: 3,
+        });
+        expect(later.isError).toBeUndefined();
+        expect(terms(later)).toEqual(served.map(seven));
+        expect(structured(later).notice).toBe(
+          `${skipped} More terms follow; call again with fromIndex ${next}.`,
+        );
+        expect(textOf(later)).toContain(skipped);
+      }
+
+      const first = await runToolContract(oeisGetTerms, { aNumber: 'A000001', limit: 3 });
+      expect(terms(first)).toEqual([seven(0), seven(1), seven(2)]);
+      expect(structured(first).notice).toBe('More terms follow; call again with fromIndex 3.');
+      expect(textOf(first)).not.toContain('not an n a(n) pair');
+      expect(calls).toHaveLength(2);
+    });
+
     describe('failures on a page request', () => {
       it('fails the call with upstream_rate_limited on a page 429', async () => {
         const { calls, result } = await getTerms(
@@ -889,6 +985,96 @@ describe('oeis_get_terms', () => {
     });
   });
 
+  describe('a limit past the 1000-term cap', () => {
+    const oneDigit = () =>
+      bFile(bFileText(Array.from({ length: 1_200 }, (_, i) => String(i % 10))));
+
+    it('serves 1000 terms and says the cap, not the limit, ended the slice', async () => {
+      const { calls, result } = await getTerms({ aNumber: 'A45', limit: 1001 }, oneDigit());
+      expect(result.isError).toBeUndefined();
+      expect(ns(result)).toEqual(Array.from({ length: 1000 }, (_, i) => i));
+      const capped =
+        'Stopped after 1000 terms, the most one call returns (limit was 1001); call again with fromIndex 1000.';
+      expect(structured(result)).toMatchObject({
+        nextFromIndex: 1000,
+        truncated: true,
+        shown: 1000,
+        cap: 1000,
+        notice: capped,
+      });
+      expect(textOf(result)).toContain(capped);
+      expect(textOf(result)).toContain('**cap:** 1000');
+      expect(textOf(result)).not.toContain('More terms follow');
+      expect(calls).toHaveLength(1);
+    });
+
+    it('names the requested limit in the cap sentence', async () => {
+      const { result } = await getTerms(
+        { aNumber: 'A45', limit: Number.MAX_SAFE_INTEGER },
+        oneDigit(),
+      );
+      expect(structured(result)).toMatchObject({ shown: 1000, cap: 1000 });
+      expect(structured(result).notice).toBe(
+        `Stopped after 1000 terms, the most one call returns (limit was ${Number.MAX_SAFE_INTEGER}); call again with fromIndex 1000.`,
+      );
+    });
+
+    it('serves every term of a short b-file with no truncation and no cap sentence', async () => {
+      const { result } = await getTerms({ aNumber: 'A45', limit: 5000 }, bFile(fibonacciBFile));
+      expect(ns(result)).toEqual(Array.from({ length: 15 }, (_, i) => i));
+      expect(structured(result)).toMatchObject({ truncated: false, shown: 15, cap: 1000 });
+      expect(structured(result)).not.toHaveProperty('nextFromIndex');
+      expect(structured(result).notice).toBeUndefined();
+    });
+
+    it('serves a whole data line with no truncation and no cap sentence', async () => {
+      const { result } = await getTerms(
+        { aNumber: 'A388000', limit: 5000 },
+        missing(),
+        record(minimalRecordJson),
+      );
+      expect(ns(result)).toEqual([1, 2, 3]);
+      expect(structured(result)).toMatchObject({
+        source: 'data',
+        truncated: false,
+        shown: 3,
+        cap: 1000,
+        notice: 'This entry has no b-file; these are the data-line terms only.',
+      });
+      expect(structured(result)).not.toHaveProperty('nextFromIndex');
+    });
+
+    it('gives the byte-budget sentence when large terms end the slice first', async () => {
+      const { result } = await getTerms(
+        { aNumber: 'A45', limit: 5000 },
+        bFile(bFileText(Array.from({ length: 300 }, (_, i) => `${i + 1}`.padEnd(1000, '7')))),
+      );
+      const shown = terms(result).length;
+      expect(shown).toBeLessThan(100);
+      expect(structured(result)).toMatchObject({ truncated: true, shown, cap: 1000 });
+      expect(structured(result).notice).toBe(
+        `Stopped after ${shown} terms to stay within the 100,000-byte response budget; call again with fromIndex ${shown}.`,
+      );
+    });
+
+    it('gives the next-part sentence when the 1000th term is the last pair of its part', async () => {
+      const PAGE0_LAST = 87_084;
+      const { calls, result } = await getTerms(
+        { aNumber: 'A000203', fromIndex: PAGE0_LAST - 999, limit: 5000 },
+        rangedFile({ body: sigmaBFile(), etag: SIGMA_ETAG }).step,
+      );
+      expect(ns(result)).toEqual(Array.from({ length: 1000 }, (_, i) => PAGE0_LAST - 999 + i));
+      expect(structured(result)).toMatchObject({
+        nextFromIndex: PAGE0_LAST + 1,
+        truncated: true,
+        shown: 1000,
+        cap: 1000,
+        notice: `More terms follow; call again with fromIndex ${PAGE0_LAST + 1}.`,
+      });
+      expect(calls).toHaveLength(1);
+    });
+  });
+
   describe('data-line fallback', () => {
     it('falls back to the record when the b-file answers 404, indexing from firstIndex', async () => {
       const { calls, result } = await getTerms(
@@ -1076,6 +1262,199 @@ describe('oeis_get_terms', () => {
     });
   });
 
+  describe('a record that lists the b-file outranks a cached miss', () => {
+    const HOUR = 60 * 60 * 1000;
+    const GAINED_URL = 'https://oeis.org/A388000/b388000.txt';
+    /** A388000's record once OEIS has added the link to its new b-file. */
+    const linked = recordWith(
+      {
+        link: ['<a href="/A388000/b388000.txt">Table of n, a(n) for n = 1..5</a>'],
+        revision: 4,
+        time: '2026-10-01T09:00:00-04:00',
+      },
+      minimalRecordJson,
+    );
+    const gained = bFile(bFileText(['1', '2', '3', '5', '8'], 1));
+    const synthesized = bFile(synthesizedBFile('A388000', ['1', '2', '3'], 1));
+    const paths = (calls: { url: string }[]) => calls.map((call) => new URL(call.url).pathname);
+
+    /** A service over `steps` with a settable clock, installed for the tool. */
+    function clockedService(...steps: ReturnType<typeof res>[]) {
+      const clock = { now: 1_800_000_000_000 };
+      const { calls, fetch } = scriptedFetch(...steps);
+      const service = new OeisService({ fetch, now: () => clock.now, pacer: immediatePacer() });
+      holder.service = service;
+      return { calls, clock, service };
+    }
+
+    it.each([
+      ['a synthesized file', synthesized],
+      ['a 404', missing()],
+    ])(
+      'reads the b-file an entry gained once its record is refetched, after %s was cached',
+      async (_label, miss) => {
+        const { calls, clock } = clockedService(
+          miss,
+          record(minimalRecordJson),
+          record(linked),
+          gained,
+        );
+        const before = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+        expect(structured(before)).toMatchObject({ source: 'data' });
+        clock.now += 25 * HOUR;
+
+        for (let call = 0; call < 2; call++) {
+          const after = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+          expect(after.isError).toBeUndefined();
+          expect(structured(after)).toMatchObject({
+            source: 'bfile',
+            bFileUrl: GAINED_URL,
+            lastAvailableIndex: 5,
+          });
+          expect(terms(after).map((term) => term.value)).toEqual(['1', '2', '3', '5', '8']);
+          expect(structured(after)).not.toHaveProperty('notice');
+          expect(textOf(after)).toContain('**Source:** bfile');
+        }
+        expect(paths(calls)).toEqual([
+          '/A388000/b388000.txt',
+          '/A388000',
+          '/A388000',
+          '/A388000/b388000.txt',
+        ]);
+      },
+    );
+
+    it('reads it in the call after a search row expires the record', async () => {
+      const row = [
+        '%I A388000 #4 Oct 01 2026 09:00:00',
+        '%S A388000 1,2,3,5,8',
+        '%N A388000 Synthetic new entry.',
+        '%K A388000 nonn,new',
+        '%O A388000 1,2',
+        '%A A388000 _Jane Doe_, Sep 28 2026',
+      ].join('\n');
+      const page = res(
+        searchPageText({ query: 'id:A388000', status: 'Showing 1-1 of 1', records: [row] }),
+        { status: 200 },
+      );
+      const { calls, clock, service } = clockedService(
+        synthesized,
+        record(minimalRecordJson),
+        page,
+        record(linked),
+        gained,
+      );
+      await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      clock.now += 2 * HOUR;
+      await service.search({ q: 'id:A388000', sort: 'relevance', start: 0 }, createMockContext());
+
+      const after = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      expect(structured(after)).toMatchObject({ source: 'bfile', lastAvailableIndex: 5 });
+      expect(paths(calls)).toEqual([
+        '/A388000/b388000.txt',
+        '/A388000',
+        '/search',
+        '/A388000',
+        '/A388000/b388000.txt',
+      ]);
+    });
+
+    it('keeps the cached miss, requesting no b-file, when the refetched record still lists none', async () => {
+      const { calls, clock } = clockedService(
+        synthesized,
+        record(minimalRecordJson),
+        record(minimalRecordJson),
+      );
+      await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      clock.now += 25 * HOUR;
+      const after = await runToolContract(oeisGetTerms, { aNumber: 'A388000' });
+      expect(structured(after)).toMatchObject({
+        source: 'data',
+        notice: 'This entry has no b-file; these are the data-line terms only.',
+      });
+      expect(paths(calls)).toEqual(['/A388000/b388000.txt', '/A388000', '/A388000']);
+    });
+
+    it.each([
+      ['404', missing()],
+      ['synthesized file', bFile(synthesizedBFile('A000045', ['0', '1', '1', '2']))],
+    ])(
+      'stays on the data line when the record links a b-file its path answers with a %s, asking once per record refetch',
+      async (_label, miss) => {
+        const { calls, clock } = clockedService(miss, record(), miss, record(), miss);
+        const cold = await runToolContract(oeisGetTerms, { aNumber: 'A000045', limit: 4 });
+        expect(structured(cold)).toMatchObject({
+          source: 'data',
+          lastAvailableIndex: 14,
+          nextFromIndex: 4,
+          notice:
+            'This entry has no b-file; these are the data-line terms only. More terms follow; call again with fromIndex 4.',
+        });
+        expect(paths(calls)).toEqual(['/A000045/b000045.txt', '/A000045', '/A000045/b000045.txt']);
+
+        const warm = await runToolContract(oeisGetTerms, { aNumber: 'A000045', limit: 4 });
+        expect(structured(warm)).toEqual(structured(cold));
+        expect(calls).toHaveLength(3);
+
+        clock.now += 24 * HOUR;
+        const refetched = await runToolContract(oeisGetTerms, { aNumber: 'A000045', limit: 4 });
+        expect(structured(refetched)).toEqual(structured(cold));
+        expect(paths(calls).slice(3)).toEqual(['/A000045', '/A000045/b000045.txt']);
+      },
+    );
+
+    it('bounds the second b-file request by what is left of the call deadline', async () => {
+      vi.useFakeTimers();
+      try {
+        const { calls, service } = serviceOver(
+          missing(),
+          async () => {
+            await new Promise((resolve) => setTimeout(resolve, 40_000));
+            return new Response(recordBody(fibonacciRecordJson), { status: 200 });
+          },
+          (call) => hang(call.init.signal),
+        );
+        holder.service = service;
+        const started = Date.now();
+        let settledAt = Number.POSITIVE_INFINITY;
+        const pending = runToolContract(oeisGetTerms, { aNumber: 'A000045' }).finally(() => {
+          settledAt = Date.now();
+        });
+        await vi.advanceTimersByTimeAsync(120_000);
+        const result = await pending;
+
+        expect(result.isError).toBe(true);
+        expect(errorOf(result)).toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          data: { reason: 'retry_deadline_exceeded' },
+        });
+        // The record took 40 s of the call's 50 s; the b-file request gets the 10 s left, not 50 s.
+        expect(settledAt - started).toBeLessThanOrEqual(50_000);
+        expect(paths(calls)).toEqual(['/A000045/b000045.txt', '/A000045', '/A000045/b000045.txt']);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('settles a call aborted during the second b-file request as RequestCancelled, never as data-line terms', async () => {
+      const controller = new AbortController();
+      const { calls, service } = serviceOver(missing(), record(), (call) => {
+        controller.abort();
+        return hang(call.init.signal);
+      });
+      holder.service = service;
+      const result = await runToolContract(
+        oeisGetTerms,
+        { aNumber: 'A000045' },
+        { context: { signal: controller.signal } },
+      );
+      expect(result.isError).toBe(true);
+      expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(structured(result)).not.toHaveProperty('terms');
+      expect(paths(calls)).toEqual(['/A000045/b000045.txt', '/A000045', '/A000045/b000045.txt']);
+    });
+  });
+
   describe('entries with no published terms', () => {
     it('reports an empty data line without first or last index', async () => {
       const raw = recordWith({ data: '', keyword: 'allocated' }, minimalRecordJson);
@@ -1124,23 +1503,6 @@ describe('oeis_get_terms', () => {
       expect(String(structured(result).notice)).not.toContain('No terms at n');
     });
 
-    it('reports a b-file that holds only comments as source bfile with no terms', async () => {
-      const { result } = await getTerms(
-        { aNumber: 'A000045' },
-        bFile('# Table of n, a(n)\n# nothing yet\n'),
-      );
-      expect(result.isError).toBeUndefined();
-      expect(structured(result)).toMatchObject({
-        source: 'bfile',
-        terms: [],
-        bFileUrl: FIB_BFILE_URL,
-        truncated: false,
-        shown: 0,
-      });
-      expect(structured(result)).not.toHaveProperty('firstAvailableIndex');
-      expect(structured(result).notice).toBe('OEIS publishes no terms for this entry.');
-    });
-
     it('never says OEIS publishes no terms when the first 1 MiB of a longer b-file holds none', async () => {
       const body = `# ${'x'.repeat(ONE_MIB)}\n0 0\n1 1\n`;
       const { calls, result } = await getTerms(
@@ -1179,8 +1541,8 @@ describe('oeis_get_terms', () => {
       expect(textOf(result)).toContain('**cap:** 25');
     });
 
-    it('carries them on the zero-result page of an empty b-file and of a past-the-end start', async () => {
-      const emptyBFile = await getTerms({ aNumber: 'A000045' }, bFile('# none\n'));
+    it('carries them on the zero-result page of a cut b-file with no pairs and of a past-the-end start', async () => {
+      const emptyBFile = await getTerms({ aNumber: 'A000045' }, bFilePartial('# none\n', 429_385));
       expect(structured(emptyBFile.result)).toMatchObject({
         truncated: false,
         shown: 0,
@@ -1300,6 +1662,35 @@ describe('oeis_get_terms', () => {
         expect(calls).toHaveLength(3);
       });
 
+      it.each([
+        ['a text body', 'Temporarily unavailable. Please retry later.\n'],
+        ['an empty body', ''],
+        ['a comments-only body', '# Table of n, a(n)\n# nothing yet\n'],
+      ])(
+        'fails a b-file with no pair (%s) as upstream_unparseable with its recovery, and requests it again next call',
+        async (_label, body) => {
+          const junk = bFile(body);
+          const { calls, result } = await run([junk, junk, junk, bFile(fibonacciBFile)]);
+          expect(result.isError).toBe(true);
+          expect(errorOf(result)).toMatchObject({
+            code: JsonRpcErrorCode.ServiceUnavailable,
+            data: {
+              reason: 'upstream_unparseable',
+              retryAttempts: 3,
+              recovery: { hint: expect.stringContaining('call oeis_get_terms again') },
+            },
+          });
+          expect(textOf(result)).toContain('reason upstream_unparseable');
+          expect(textOf(result)).toContain('call oeis_get_terms again');
+          expect(calls).toHaveLength(3);
+          expect(calls.every((call) => call.url === FIB_BFILE_URL)).toBe(true);
+
+          const next = await runToolContract(oeisGetTerms, { aNumber: 'A000045' });
+          expect(structured(next)).toMatchObject({ source: 'bfile', shown: 15 });
+          expect(calls).toHaveLength(4);
+        },
+      );
+
       it('fails when the record fetch after a b-file 404 hits a 5xx', async () => {
         const { calls, result } = await run([missing(), res('oops', { status: 500 })]);
         expect(errorOf(result)).toMatchObject({
@@ -1409,7 +1800,7 @@ describe('oeis_get_terms', () => {
       });
     });
 
-    it('declares sequence_not_found, pacer_shed, and upstream_rate_limited', () => {
+    it('declares sequence_not_found, pacer_shed, upstream_rate_limited, and upstream_unparseable', () => {
       expect(oeisGetTerms.errors).toEqual([
         expect.objectContaining({
           reason: 'sequence_not_found',
@@ -1425,6 +1816,12 @@ describe('oeis_get_terms', () => {
           reason: 'upstream_rate_limited',
           code: JsonRpcErrorCode.RateLimited,
           retryable: true,
+          thrownBy: 'service',
+          recovery: expect.stringContaining('oeis_get_terms again'),
+        }),
+        expect.objectContaining({
+          reason: 'upstream_unparseable',
+          code: JsonRpcErrorCode.ServiceUnavailable,
           thrownBy: 'service',
           recovery: expect.stringContaining('oeis_get_terms again'),
         }),

@@ -72,7 +72,8 @@ const RECORD_TTL_MS = 24 * 60 * 60 * 1000;
 const MISSING_TTL_MS = 60 * 60 * 1000;
 const SEARCH_TTL_MS = 60 * 60 * 1000;
 const BFILE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const BFILE_LINE = /^\s*(-?\d+)\s+(-?\d+)\s*$/;
+/** A b-file pair line (oeis.org/SubmitB.html): `n a(n)`, separated by spaces or tabs. */
+const BFILE_LINE = /^\s*(-?\d+)[ \t]+(-?\d+)\s*$/;
 /**
  * First line of the file OEIS serves at the b-file path of an entry that has none, built from the
  * data line: `# A181630 (b-file synthesized from sequence entry)`.
@@ -100,8 +101,16 @@ interface BFilePage {
    * holds it whole.
    */
   headLost: boolean;
+  /** Whole lines that are neither blank, a `#` comment, nor a pair; absent when none. */
+  malformedLines?: number;
   /** Offset of the first whole line. */
   startByte: number;
+  terms: BFileTerm[];
+}
+
+/** The pairs of some whole b-file lines and how many of them were malformed. */
+interface ParsedLines {
+  malformedLines: number;
   terms: BFileTerm[];
 }
 
@@ -224,21 +233,33 @@ function parseRecordBody(text: string): SequenceRecord {
   return normalizeRecord(body);
 }
 
-/** The `n a(n)` pairs of whole b-file lines, in order; any other line is skipped. */
-function parsePairs(text: string): BFileTerm[] {
+/**
+ * The `n a(n)` pairs of whole b-file lines, in order. A line is blank (whitespace only), a comment
+ * (`#` its first non-blank character), or a pair with `n` a safe integer; any other line is skipped
+ * and counted as malformed.
+ */
+function parsePairs(text: string): ParsedLines {
   const terms: BFileTerm[] = [];
+  let malformedLines = 0;
   for (const line of text.split('\n')) {
     const match = BFILE_LINE.exec(line);
-    if (!match) continue;
-    const n = Number(match[1]);
-    if (Number.isSafeInteger(n)) terms.push({ n, value: match[2] ?? '' });
+    const n = Number(match?.[1]);
+    if (match && Number.isSafeInteger(n)) {
+      terms.push({ n, value: match[2] ?? '' });
+      continue;
+    }
+    const content = line.trim();
+    if (content !== '' && !content.startsWith('#')) malformedLines++;
   }
   // Each value is a slice of `text`, and a cached slice keeps the whole decoded page alive.
-  return JSON.parse(JSON.stringify(terms)) as BFileTerm[];
+  return { malformedLines, terms: JSON.parse(JSON.stringify(terms)) as BFileTerm[] };
 }
 
-/** Pairs of a b-file's first page; a `cut` read drops its trailing partial line. */
-function parseBFile(text: string, cut: boolean): BFileTerm[] {
+/**
+ * Pairs of a b-file's first page; a `cut` read drops its trailing partial line. A page read whole
+ * that holds no pair is not a b-file: an empty body, comments only, or an error text served as one.
+ */
+function parseBFile(text: string, cut: boolean): ParsedLines {
   if (HTML_START.test(text)) {
     throw serviceUnavailable(
       'OEIS returned an HTML page in place of a b-file, likely a maintenance page.',
@@ -247,7 +268,14 @@ function parseBFile(text: string, cut: boolean): BFileTerm[] {
       },
     );
   }
-  return parsePairs(cut ? text.slice(0, text.lastIndexOf('\n') + 1) : text);
+  const parsed = parsePairs(cut ? text.slice(0, text.lastIndexOf('\n') + 1) : text);
+  if (!cut && parsed.terms.length === 0) {
+    throw serviceUnavailable(
+      'OEIS returned a b-file with no "n a(n)" line, likely an error or maintenance page.',
+      { reason: 'upstream_unparseable' },
+    );
+  }
+  return parsed;
 }
 
 /**
@@ -268,7 +296,7 @@ async function readHead(res: Response): Promise<BFileHead> {
       ? headerInt(res.headers.get('content-range')?.split('/')[1] ?? null)
       : headerInt(res.headers.get('content-length'));
   const cut = overflowed || (sizeInBytes !== undefined && sizeInBytes > bytes.length);
-  const terms = parseBFile(text, cut);
+  const { malformedLines, terms } = parseBFile(text, cut);
   const first = terms[0];
   const last = terms.at(-1);
   const etag = res.headers.get('etag');
@@ -287,6 +315,7 @@ async function readHead(res: Response): Promise<BFileHead> {
       ...(sizeInBytes !== undefined && { sizeInBytes }),
       cut,
       ...(cut && !paging && { firstMibOnly: true }),
+      ...(malformedLines > 0 && { malformedLines }),
     },
     ...(paging && { paging }),
   };
@@ -301,11 +330,13 @@ function parsePage(bytes: Uint8Array, start: number, final: boolean): BFilePage 
   const firstBreak = bytes.indexOf(LINE_FEED);
   const from = firstBreak === -1 ? bytes.length : firstBreak + 1;
   const to = Math.max(from, final ? bytes.length : bytes.lastIndexOf(LINE_FEED) + 1);
+  const { malformedLines, terms } = parsePairs(new TextDecoder().decode(bytes.subarray(from, to)));
   return {
     endByte: start + to,
     headLost: firstBreak === -1 || firstBreak >= BFILE_OVERLAP_BYTES,
     startByte: start + from,
-    terms: parsePairs(new TextDecoder().decode(bytes.subarray(from, to))),
+    terms,
+    ...(malformedLines > 0 && { malformedLines }),
   };
 }
 
@@ -428,7 +459,8 @@ export class OeisService {
    * search row shows a later edit (see `search`); after that it is revalidated with
    * `If-Modified-Since` (a `304` refreshes it without a body). A `404` is remembered for 1 h, or
    * until a fresh search row lists the entry, so a repeated missing A-number makes no further
-   * request.
+   * request. A record fetched or revalidated with a `bFileUrl` drops the A-number's cached b-file
+   * miss (never a cached file), so the next `getBFile` asks the b-file path again.
    *
    * @returns The record, or `undefined` when OEIS answers `404` for the A-number.
    */
@@ -485,6 +517,11 @@ export class OeisService {
       throw serviceUnavailable('OEIS answered 304 Not Modified to a request with no cached copy.', {
         reason: 'upstream_unparseable',
       });
+    }
+    // A record that lists the b-file outranks a cached miss (never a cached file).
+    const bFile = fresh.record.bFileUrl ? this.cache.peek(`bfile:${aNumber}`) : undefined;
+    if (bFile?.value.kind === 'bfile' && bFile.value.head.read.status === 'missing') {
+      this.cache.delete(`bfile:${aNumber}`);
     }
     this.cache.set(
       key,
@@ -564,10 +601,13 @@ export class OeisService {
    * Reads an entry's b-file from its canonical path. The first page, bytes 0 to 1 MiB − 1, is read on
    * every call; when `fromIndex` lies past it in a larger file, the page holding it is read as well
    * (see `locate`). Pages are cached for 7 days: the first under the A-number, a later one under its
-   * index and the first page's ETag, so no page ever answers for another version of the file.
+   * index and the first page's ETag, so no page ever answers for another version of the file. A
+   * miss is cached as long, unless `getRecord` drops it on a record that lists the b-file.
    *
    * @returns `{ status: 'missing' }` when the entry has no b-file: OEIS answers `404`, or `200` with
    *   a file it synthesized from the data line.
+   * @throws {McpError} `ServiceUnavailable` with `reason: 'upstream_unparseable'`, retried and never
+   *   cached, when the first page is HTML, or is read whole and holds no pair.
    */
   async getBFile(aNumber: string, ctx: Context, options: BFileOptions = {}): Promise<BFileRead> {
     const startedAt = Date.now();
@@ -658,6 +698,7 @@ export class OeisService {
         {
           endByte: paging.endByte,
           headLost: false,
+          ...(read.malformedLines && { malformedLines: read.malformedLines }),
           startByte: 0,
           terms: read.terms,
         },
@@ -741,6 +782,7 @@ export class OeisService {
       sizeInBytes: paging.size,
       cut,
       ...(skippedLine && { skippedLine: true }),
+      ...(page?.malformedLines && { malformedLines: page.malformedLines }),
       ...(page === undefined && { unreached: true }),
     };
   }
