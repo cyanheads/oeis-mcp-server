@@ -8,7 +8,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { formatOutline, outlineOnOverflow, type SectionMeta } from '@cyanheads/mcp-ts-core/utils';
-import { blockquote, fence, inline, offsetLine } from '@/mcp-server/shared/markdown.js';
+import { codeSpan, fence, inline, offsetLine } from '@/mcp-server/shared/markdown.js';
 import { ANumberSchema, blankAsUnset } from '@/mcp-server/shared/oeis-schemas.js';
 import { isReservedEntry } from '@/services/oeis/normalize-record.js';
 import { getOeisService } from '@/services/oeis/oeis-service.js';
@@ -322,34 +322,22 @@ function lifecycleNotice(keywords: readonly string[]): string | undefined {
   return;
 }
 
-/**
- * Renders an upstream URL as an inline code span, so it reads as plain text and no renderer turns
- * it into a link or emphasis. The backtick run outgrows any in the URL (a query keeps them raw).
- */
-function codeSpan(text: string): string {
-  let longest = 0;
-  for (const run of text.matchAll(/`+/g)) longest = Math.max(longest, run[0].length);
-  const ticks = '`'.repeat(longest + 1);
-  const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : '';
-  return `${ticks}${pad}${text}${pad}${ticks}`;
-}
-
-/** Renders a line section as one blockquote per line, or "None." when the entry has no lines. */
-function quotedLines(heading: string, lines: readonly string[]): string {
-  return `## ${heading}\n\n${lines.length ? lines.map(blockquote).join('\n\n') : 'None.'}`;
+/** Renders a line section as one code block, one line per item, or "None." when it has no items. */
+function fencedLines(heading: string, lines: readonly string[]): string {
+  return `## ${heading}\n\n${lines.length ? fence(lines.join('\n')) : 'None.'}`;
 }
 
 /** Renders the output as markdown: the core fields, each present section, a cut's next call, and the outline. */
 function formatSequence(result: SequenceOutput) {
   const lines = [
-    `# ${result.aNumber}: ${inline(result.name)}`,
+    `# ${result.aNumber}: ${codeSpan(result.name)}`,
     '',
     `**Kind:** ${result.kind}`,
     `**Terms:** ${result.terms.length ? inline(result.terms.join(', ')) : 'none listed'}`,
     offsetLine(result.offset, result.firstIndex),
     `**Keywords:** ${result.keywords.length ? inline(result.keywords.join(', ')) : 'none'}`,
   ];
-  if (result.author) lines.push(`**Author:** ${inline(result.author)}`);
+  if (result.author) lines.push(`**Author:** ${codeSpan(result.author)}`);
   if (result.legacyIds) lines.push(`**Legacy IDs:** ${inline(result.legacyIds.join(', '))}`);
   lines.push(
     `**Referenced by:** ${result.referenceCount} entries (this one included)`,
@@ -361,15 +349,9 @@ function formatSequence(result: SequenceOutput) {
   if (result.bFileUrl) lines.push(`**b-file:** ${inline(result.bFileUrl)}`);
 
   const blocks: string[] = [lines.join('\n')];
-  if (result.comments) blocks.push(quotedLines('Comments', result.comments));
-  if (result.formulas) blocks.push(quotedLines('Formulas', result.formulas));
-  if (result.examples) {
-    blocks.push(
-      ['## Examples', result.examples.length ? fence(result.examples.join('\n')) : 'None.'].join(
-        '\n\n',
-      ),
-    );
-  }
+  if (result.comments) blocks.push(fencedLines('Comments', result.comments));
+  if (result.formulas) blocks.push(fencedLines('Formulas', result.formulas));
+  if (result.examples) blocks.push(fencedLines('Examples', result.examples));
   if (result.programs) {
     const programBlocks = result.programs.map(
       (program) =>
@@ -379,18 +361,18 @@ function formatSequence(result: SequenceOutput) {
       ['## Programs', ...(programBlocks.length ? programBlocks : ['None.'])].join('\n\n'),
     );
   }
-  if (result.references) blocks.push(quotedLines('References', result.references));
+  if (result.references) blocks.push(fencedLines('References', result.references));
   if (result.links) {
     const linkLines = result.links.map(
       (link) =>
-        `- ${inline(link.text)}${link.urls.length ? ` — ${link.urls.map(codeSpan).join(' ')}` : ''}`,
+        `- ${codeSpan(link.text)}${link.urls.length ? ` — ${link.urls.map(codeSpan).join(' ')}` : ''}`,
     );
     blocks.push(['## Links', linkLines.length ? linkLines.join('\n') : 'None.'].join('\n\n'));
   }
   if (result.crossReferences) {
-    blocks.push(quotedLines('Cross-references', result.crossReferences));
+    blocks.push(fencedLines('Cross-references', result.crossReferences));
   }
-  if (result.extensions) blocks.push(quotedLines('Extensions', result.extensions));
+  if (result.extensions) blocks.push(fencedLines('Extensions', result.extensions));
   if (result.nextFromItem) {
     blocks.push(
       `**Next:** call again with the same sections and fromItem ${JSON.stringify(result.nextFromItem)}.`,

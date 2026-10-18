@@ -32,6 +32,7 @@ import {
   syntheticSearchPage,
   tooManySearchPage,
 } from '../fixtures/oeis-upstream.js';
+import { codeTexts, elements, headings, render } from '../fixtures/rendered-markdown.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, queryOf, serviceOver, withBackoff } from '../fixtures/tool-service.js';
 
@@ -329,14 +330,14 @@ describe('oeis_get_cross_refs', () => {
       expect(first).toContain(
         [
           '**Keywords:** nonn, tabl, nice, easy, core, look, hear, changed',
-          '**Author:** _N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994',
+          '**Author:** `_N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994`',
           '**Legacy IDs:** M0082',
           '**Modified:** 2026-09-25T10:59:50-04:00',
           '**URL:** https://oeis.org/A007318',
         ].join('\n'),
       );
       expect(second).toContain(
-        '**Author:** Simon P. Norton\n**Modified:** 2026-06-30T19:56:59-04:00',
+        '**Author:** `Simon P. Norton`\n**Modified:** 2026-06-30T19:56:59-04:00',
       );
       expect(second).not.toContain('**Legacy IDs:**');
       for (const label of ['**Author:**', '**Legacy IDs:**', '**Modified:**']) {
@@ -514,7 +515,7 @@ describe('oeis_get_cross_refs', () => {
         expect(textOf(result)).not.toMatch(/javascript:|data:/i);
       });
 
-      it('escapes link, image, and HTML syntax in notes and lines, and keeps both verbatim in structuredContent', async () => {
+      it('renders link, image, and HTML syntax in notes and lines as inert text, and keeps both verbatim in structuredContent', async () => {
         const line =
           'Cf. A000032 (see [here](https://attacker.example/n)), A001045 (<img src=x onerror=alert(7)>).';
         const { result } = await crossRefs(
@@ -528,11 +529,20 @@ describe('oeis_get_cross_refs', () => {
         ]);
         expect(structured(result).lines).toEqual([line]);
         const text = textOf(result);
-        expect(text).toContain('**Note:** see [here\\](https://attacker.example/n)');
-        expect(text).toContain('**Note:** \\<img src=x onerror=alert(7)>');
-        expect(text).toContain(
-          '> Cf. A000032 (see [here\\](https://attacker.example/n)), A001045 (\\<img src=x onerror=alert(7)>).',
+        expect(text).toContain('**Note:** `see [here](https://attacker.example/n)`');
+        expect(text).toContain('**Note:** `<img src=x onerror=alert(7)>`');
+        expect(text).toContain(`Line 0:\n\`\`\`\n${line}\n\`\`\``);
+
+        const { html } = render(text);
+        expect(codeTexts(html)).toEqual(
+          expect.arrayContaining([
+            'see [here](https://attacker.example/n)',
+            '<img src=x onerror=alert(7)>',
+            `${line}\n`,
+          ]),
         );
+        expect(html).not.toContain('attacker.example/n"');
+        expect(elements(html, 'img')).toEqual([]);
       });
     });
 
@@ -1081,10 +1091,10 @@ describe('oeis_get_cross_refs', () => {
 
       const [first, second, third] = textOf(result).split('\n\n## ').slice(1);
       expect(first).toContain(
-        '**Author:** _N. J. A. Sloane_, Jun 06 2002\n**Modified:** 2026-01-15T13:24:20-05:00\n**URL:** https://oeis.org/A068875',
+        '**Author:** `_N. J. A. Sloane_, Jun 06 2002`\n**Modified:** 2026-01-15T13:24:20-05:00\n**URL:** https://oeis.org/A068875',
       );
       expect(second).toContain(
-        '**Author:** _N. J. A. Sloane_\n**Legacy IDs:** M2975\n**Modified:** 2026-07-30T18:33:54-04:00',
+        '**Author:** `_N. J. A. Sloane_`\n**Legacy IDs:** M2975\n**Modified:** 2026-07-30T18:33:54-04:00',
       );
       expect(third).toContain('**Modified:** 2026-09-29T20:19:41-04:00');
       expect(third).not.toContain('**Author:**');
@@ -1412,23 +1422,64 @@ describe('oeis_get_cross_refs', () => {
       expect(text).toContain('# Sequences A000045 cross-references (start 0)');
       expect(text).toContain('**Direction:** outgoing');
       related(result).forEach((row, i) => {
-        expect(text).toContain(`## ${i + 1}. ${row.aNumber}: ${row.name}`);
+        expect(text).toContain(`## ${i + 1}. ${row.aNumber}: \`${row.name}\``);
         expect(text).toContain('**Resolved:** yes');
         expect(text).toContain(`**Terms:** ${row.terms?.join(', ')}`);
         expect(text).toContain(`**Offset:** ${row.offset}`);
         expect(text).toContain(`**First term:** a(${row.firstIndex})`);
         expect(text).toContain(`**Keywords:** ${row.keywords?.join(', ')}`);
-        expect(text).toContain(`**Author:** ${row.author}`);
+        expect(text).toContain(`**Author:** \`${row.author}\``);
         expect(text).toContain(`**Legacy IDs:** ${row.legacyIds?.join(', ')}`);
         expect(text).toContain(`**Modified:** ${row.modified}`);
         expect(text).toContain(`**URL:** ${row.url}`);
       });
-      expect(text).toContain('**Note:** Lucas');
+      expect(text).toContain('**Note:** `Lucas`');
       expect(text).toContain('**Cross-reference line:** 0');
       expect(text).toContain('**Cross-reference line:** 1');
       expect(text).toContain('## Cross-reference lines');
-      expect(text).toContain('Line 0:\n> Cf. A000032 (Lucas), A001045.');
-      expect(text).toContain('Line 1:\n> Row sums of A011973.');
+      expect(text).toContain('Line 0:\n```\nCf. A000032 (Lucas), A001045.\n```');
+      expect(text).toContain('Line 1:\n```\nRow sums of A011973.\n```');
+    });
+
+    it('renders contributor names, notes, authors, and lines verbatim and inert, as a markdown renderer shows them', async () => {
+      const factorial =
+        'Factorial numbers: n! = 1*2*3*4*...*n (order of symmetric group S_n, number of permutations of n letters).';
+      const bell = 'Bell numbers: `1234, `2`134, `23`14 ``` [x](https://e.example) <img src=x>';
+      const lines = [
+        'Cf. A000142 (1*2*...*n), A000110 (`23`14 [ref]: https://e.example).',
+        '# not a heading',
+        '- not a list ~~x~~',
+        '1. not a list',
+      ];
+      const { result } = await crossRefs(
+        { aNumber: 'A45' },
+        record(withXref(lines)),
+        page(
+          searchPageText({
+            query: 'id:a000142|id:a000110',
+            status: 'Showing 1-2 of 2',
+            records: [summary('A000142', { name: factorial }), summary('A000110', { name: bell })],
+          }),
+        ),
+      );
+      const rows = related(result);
+      const author = '_N. J. A. Sloane_, Apr 30 1991';
+      expect(rows.map((row) => [row.name, row.note, row.author])).toEqual([
+        [factorial, '1*2*...*n', author],
+        [bell, '`23`14 [ref]: https://e.example', author],
+      ]);
+      const { html, text } = render(textOf(result));
+      expect(headings(html)).toEqual([
+        'h1 Sequences A000045 cross-references (start 0)',
+        `h2 1. A000142: ${factorial}`,
+        `h2 2. A000110: ${bell}`,
+        'h2 Cross-reference lines',
+      ]);
+      for (const row of rows) expect(text).toContain(`Note: ${row.note}`);
+      expect(text.split(`Author: ${author}`)).toHaveLength(rows.length + 1);
+      for (const line of lines) expect(codeTexts(html)).toContain(`${line}\n`);
+      for (const tag of ['em', 'del', 'img', 'li']) expect(elements(html, tag), tag).toEqual([]);
+      expect(html).not.toMatch(/(?:href|src)="[^"]*e\.example/);
     });
 
     it('renders an incoming result with its heading and no cross-reference lines section', async () => {
@@ -1441,7 +1492,7 @@ describe('oeis_get_cross_refs', () => {
       const text = textOf(result);
       expect(text).toContain('# Entries that mention A000045 (start 20)');
       expect(text).toContain('**Direction:** incoming');
-      expect(text).toContain('## 21. A100000: Synthetic 0.');
+      expect(text).toContain('## 21. A100000: `Synthetic 0.`');
       expect(text).not.toContain('## Cross-reference lines');
       expect(text).not.toContain('**Cross-reference line:**');
       expect(text).toContain('**Next page:** call again with start 30.');
@@ -1456,7 +1507,7 @@ describe('oeis_get_cross_refs', () => {
       const text = textOf(result);
       expect(text).toContain('## 1. A000032\n');
       expect(text).toContain('**Resolved:** no (name and terms not fetched)');
-      expect(text).toContain('**Note:** Lucas');
+      expect(text).toContain('**Note:** `Lucas`');
       expect(text).not.toContain('**Terms:**');
       expect(text).not.toContain('**Offset:**');
       expect(text).toContain('**URL:** https://oeis.org/A000032');
@@ -1470,7 +1521,7 @@ describe('oeis_get_cross_refs', () => {
       expect(text).toContain(String(structured(result).notice));
     });
 
-    it('flattens CR/LF in every inline slot and quotes every line of a multi-line cross-reference', () => {
+    it('flattens CR/LF in every inline slot and fences a multi-line cross-reference line whole', () => {
       const blocks = oeisGetCrossRefs.format?.({
         aNumber: 'A000001',
         direction: 'outgoing',
@@ -1492,17 +1543,19 @@ describe('oeis_get_cross_refs', () => {
         start: 10,
       });
       const text = blocksText(blocks);
-      expect(text).toContain('## 11. A000002: a b c');
-      expect(text).toContain('**Note:** n1 # n2');
+      expect(text).toContain('## 11. A000002: `a b c`');
+      expect(text).toContain('**Note:** `n1 # n2`');
       expect(text).toContain('**Terms:** 1, 2 3');
       expect(text).toContain('**Offset:** 0,1 # x');
       expect(text).toContain('**Keywords:** nonn ## y, easy');
-      expect(text).toContain('> Cf. A000002\n> # not a heading\n> - not a list');
-      expect(text.split('\n').filter((line) => line.startsWith('#'))).toEqual([
-        '# Sequences A000001 cross-references (start 10)',
-        '## 11. A000002: a b c',
-        '## Cross-reference lines',
+      expect(text).toContain('Line 0:\n```\nCf. A000002\n# not a heading\r\n- not a list\n```');
+      const { html } = render(text);
+      expect(headings(html)).toEqual([
+        'h1 Sequences A000001 cross-references (start 10)',
+        'h2 11. A000002: a b c',
+        'h2 Cross-reference lines',
       ]);
+      expect(elements(html, 'li')).toEqual([]);
     });
 
     it('renders empty terms and keywords as none, an empty lines list as None, and nextStart only when present', () => {
@@ -1532,7 +1585,7 @@ describe('oeis_get_cross_refs', () => {
       );
     });
 
-    it('renders the author, legacy IDs, and last edit of a resolved row, with markup in the author escaped', () => {
+    it('renders the author, legacy IDs, and last edit of a resolved row, with markup in the author inert', () => {
       const text = blocksText(
         oeisGetCrossRefs.format?.({
           aNumber: 'A000108',
@@ -1556,16 +1609,18 @@ describe('oeis_get_cross_refs', () => {
       expect(text).toContain(
         [
           '**Keywords:** nonn',
-          '**Author:** \\<a>Eve\\</a> [site\\](https://attacker.example) # Mallory',
+          '**Author:** `<a>Eve</a> [site](https://attacker.example) # Mallory`',
           '**Legacy IDs:** M0001, N0002',
           '**Modified:** 2026-11-01T01:30:00-04:00',
           '**URL:** https://oeis.org/A000002',
         ].join('\n'),
       );
-      expect(text.split('\n').filter((line) => line.startsWith('#'))).toEqual([
-        '# Entries that mention A000108 (start 0)',
-        '## 1. A000002: x',
+      const { html } = render(text);
+      expect(headings(html)).toEqual([
+        'h1 Entries that mention A000108 (start 0)',
+        'h2 1. A000002: x',
       ]);
+      expect(html).not.toContain('attacker.example"');
     });
 
     it('renders resolved and unresolved rows without author, modified, or legacyIds line for line', () => {
@@ -1599,9 +1654,9 @@ describe('oeis_get_cross_refs', () => {
           '',
           '**Direction:** outgoing',
           '',
-          '## 1. A000032: Lucas numbers.',
+          '## 1. A000032: `Lucas numbers.`',
           '**Resolved:** yes',
-          '**Note:** Lucas',
+          '**Note:** `Lucas`',
           '**Cross-reference line:** 0',
           '**Terms:** 2, 1, 3',
           '**Offset:** 0,1',
@@ -1617,7 +1672,9 @@ describe('oeis_get_cross_refs', () => {
           '## Cross-reference lines',
           '',
           'Line 0:',
-          '> Cf. A000032 (Lucas), A001045.',
+          '```',
+          'Cf. A000032 (Lucas), A001045.',
+          '```',
           '',
           '**Next page:** call again with start 10.',
         ].join('\n'),

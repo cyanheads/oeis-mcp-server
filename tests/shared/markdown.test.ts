@@ -1,15 +1,17 @@
 /**
- * @fileoverview Tests for the shared markdown helpers: inline flattening, blockquotes, markup
- * escaping, dynamic-length fences, and the summary-row block. CR/LF in upstream text must stay out
- * of inline slots, and link, image, and HTML syntax must render as text.
+ * @fileoverview Tests for the shared markdown helpers: code spans and fences for contributor text,
+ * inline flattening and markup escaping for upstream tokens, and the summary-row block. Contributor
+ * text must render exactly as written, read by marked in GFM mode; CR/LF must stay out of inline
+ * slots; link, image, and HTML syntax in a token must render as text. Every scan is linear.
  * @module tests/shared/markdown.test
  */
 
 import type { z } from '@cyanheads/mcp-ts-core';
 import { describe, expect, it } from 'vitest';
-import { blockquote, fence, inline, summaryLines } from '@/mcp-server/shared/markdown.js';
+import { codeSpan, fence, inline, summaryLines } from '@/mcp-server/shared/markdown.js';
 import type { SequenceSummarySchema } from '@/mcp-server/shared/oeis-schemas.js';
 import { cpuMs } from '../fixtures/cpu-time.js';
+import { codeTexts, elements, headings, render } from '../fixtures/rendered-markdown.js';
 
 type Row = z.infer<typeof SequenceSummarySchema>;
 
@@ -22,6 +24,79 @@ const row: Row = {
   keywords: ['core', 'nonn'],
   url: 'https://oeis.org/A000108',
 };
+
+const MIB = 1024 * 1024;
+
+/** U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR: marked ends a heading at either. */
+const LS = String.fromCharCode(0x2028);
+const PS = String.fromCharCode(0x2029);
+
+/**
+ * Contributor text a markdown renderer would read as markup: emphasis, strikethrough, a link, an
+ * image, HTML, a link reference definition, headings, a quote marker, list markers, entities,
+ * backslash escapes, and backtick runs of every length.
+ */
+const MARKUP = [
+  'Factorial numbers: n! = 1*2*3*4*...*n (order of symmetric group S_n, number of permutations of n letters).',
+  'a(n) = binomial(2*n, n)/(n+1) = (2*n)!/(n!*(n+1)!) = A000984(n)/(n+1).',
+  '`1234, `2`134, `23`14',
+  '```',
+  'a `b` ``c`` d',
+  '[x](https://e.example)',
+  '![i](https://e.example/i.png)',
+  '<img src=x>',
+  '[ref]: https://e.example',
+  '# heading',
+  '## subheading',
+  '> quoted',
+  '- item',
+  '1. first',
+  '~~struck~~ _under_ __strong__ \\*kept\\* &amp; &lt;b&gt; https://e.example/auto',
+  ' leading and trailing spaces ',
+  '   ',
+];
+
+/**
+ * Asserts `run` takes time linear in its input: each doubling of `shape` from `from` characters to
+ * 64 times that stays under the CPU bound before the next size is tried, and over the full span the
+ * cost grows less than 256-fold (64-fold when linear, 4,096-fold when quadratic).
+ */
+function expectLinear(
+  run: (text: string) => unknown,
+  shape: (chars: number) => string,
+  from: number,
+) {
+  const REPEAT = 20;
+  const SAMPLES = 3;
+  const fastest: number[] = [];
+  run(shape(from));
+  for (let chars = from; chars <= from * 64; chars *= 2) {
+    const text = shape(chars);
+    const spent = Array.from({ length: SAMPLES }, () =>
+      cpuMs(() => {
+        for (let i = 0; i < REPEAT; i++) run(text);
+      }),
+    );
+    const ms = Math.min(...spent);
+    expect(ms, `${chars} characters`).toBeLessThan(1_000);
+    fastest.push(ms);
+  }
+  expect((fastest.at(-1) ?? Number.NaN) / (fastest[0] ?? Number.NaN)).toBeLessThan(256);
+}
+
+/**
+ * Inputs for the linear-time tests, each sized to `chars`: a digit run that no scan stops in, then
+ * backtick runs, line breaks, and the two interleaved. The digit run carries the full 64× span from
+ * 5,000 characters; the others stop at 64,000, below Bun's regex slow-mode switch.
+ */
+const SHAPES: [string, (chars: number) => string, number][] = [
+  ['a digit run', (chars) => '9'.repeat(chars), 5_000],
+  ['one backtick run', (chars) => '`'.repeat(chars), 1_000],
+  ['alternating backticks', (chars) => '`a'.repeat(chars / 2), 1_000],
+  ['growing backtick runs', (chars) => '`a``a```a'.repeat(chars / 9), 1_000],
+  ['line breaks after text', (chars) => `${'§1 x'.repeat(chars / 4)}\ny`, 1_000],
+  ['backticks between line breaks', (chars) => '`\r\n'.repeat(chars / 3), 1_000],
+];
 
 describe('inline', () => {
   it('leaves single-line text alone', () => {
@@ -44,27 +119,7 @@ describe('inline', () => {
   });
 });
 
-describe('blockquote', () => {
-  it('prefixes every line, whatever the line ending', () => {
-    expect(blockquote('one')).toBe('> one');
-    expect(blockquote('one\ntwo')).toBe('> one\n> two');
-    expect(blockquote('one\r\ntwo')).toBe('> one\n> two');
-    expect(blockquote('one\rtwo')).toBe('> one\n> two');
-  });
-
-  it('keeps blank lines inside the quote', () => {
-    expect(blockquote('a\n\nb')).toBe('> a\n> \n> b');
-  });
-
-  it('leaves no unquoted line when upstream text tries to start a heading or list', () => {
-    const lines = blockquote('# heading\r\n- item\r\n---').split('\n');
-    expect(lines.every((line) => line.startsWith('> '))).toBe(true);
-  });
-});
-
-describe('markup in contributor text', () => {
-  const MIB = 1024 * 1024;
-
+describe('markup in an upstream token', () => {
   /** Each link, image, or HTML opener in `text` that no odd run of backslashes escapes. */
   const liveMarkup = (text: string) =>
     [...text.matchAll(/(?<!\\)(?:\\\\)*(?:\]\(|<[A-Za-z/!?])|!\[/g)].map((match) => match[0]);
@@ -76,9 +131,8 @@ describe('markup in contributor text', () => {
     '<https://attacker.example/autolink> <!-- comment --> <?php ?> <!DOCTYPE html>',
     '\\[x](u) and [y\\\\](v) and \\\\<b>bold\\\\</b>',
     'line one\n<div>\n[two](https://attacker.example)\r\n![three](x)',
-  ])('leaves no live link, image, or tag in %j, inline or quoted', (text) => {
+  ])('leaves no live link, image, or tag in %j', (text) => {
     expect(liveMarkup(inline(text))).toEqual([]);
-    expect(liveMarkup(blockquote(text))).toEqual([]);
   });
 
   it.each([
@@ -108,18 +162,9 @@ describe('markup in contributor text', () => {
     ['[x]: https://e.example', '\\[x]: https://e.example'],
     ['[a\\]b]: javascript:x', '\\[a\\]b]: javascript:x'],
     ['[a](b)]: c', '\\[a\\](b)]: c'],
+    ['[multi\nline]: https://e.example', '\\[multi line]: https://e.example'],
   ])('escapes the bracket that opens a link reference definition in %j', (text, expected) => {
     expect(inline(text)).toBe(expected);
-  });
-
-  it('escapes a link reference definition on any quoted line, inside nested containers, or across lines', () => {
-    expect(blockquote('first line\n[x]: https://e.example "t"')).toBe(
-      '> first line\n> \\[x]: https://e.example "t"',
-    );
-    expect(blockquote('> - [x]: https://e.example')).toBe('> > - \\[x]: https://e.example');
-    expect(blockquote('[multi\nline]: https://e.example')).toBe(
-      '> \\[multi\n> line]: https://e.example',
-    );
   });
 
   it.each([
@@ -132,9 +177,8 @@ describe('markup in contributor text', () => {
     'Table[Fibonacci[n], {n, 0, 40}]; a[n_] := a[n-1] + a[n-2]',
     'a(n) ~ phi^n/sqrt(5) as n -> oo, where phi = (1+sqrt(5))/2; 3! = 6, [1, 2], [3, 5, 8].',
     '(PARI) a(n) = if(n<1, 0, fibonacci(n)) \\\\ a comment',
-  ])('leaves the formula %j exactly as written', (text) => {
+  ])('leaves %j exactly as written', (text) => {
     expect(inline(text)).toBe(text);
-    expect(blockquote(text)).toBe(`> ${text}`);
   });
 
   it.each([
@@ -144,9 +188,81 @@ describe('markup in contributor text', () => {
     ['repeated tag openers', '<a '.repeat(MIB / 4)],
     ['bracketed lines', '[\n'.repeat(MIB / 2)],
   ])('escapes 1 MiB of %s in linear time', (_shape, text) => {
-    for (const render of [inline, blockquote]) {
-      expect(cpuMs(() => render(text))).toBeLessThan(1_000);
+    expect(cpuMs(() => inline(text))).toBeLessThan(1_000);
+  });
+});
+
+describe('codeSpan', () => {
+  it.each([
+    ['Catalan numbers', '`Catalan numbers`'],
+    ['a `b` c', '``a `b` c``'],
+    ['a `b` ``c`` d', '```a `b` ``c`` d```'],
+    ['`1234, `2`134, `23`14', '`` `1234, `2`134, `23`14 ``'],
+    ['```', '```` ``` ````'],
+    ['x `', '`` x ` ``'],
+    [' x', '`  x `'],
+    ['x ', '` x  `'],
+    ['   ', '`   `'],
+    ['https://example.org/a``b', '```https://example.org/a``b```'],
+  ])('renders %j as %j', (text, expected) => {
+    expect(codeSpan(text)).toBe(expected);
+  });
+
+  it.each([
+    ['a\nb', '`a b`'],
+    ['a\r\nb', '`a b`'],
+    ['a\rb', '`a b`'],
+    ['a\n\n\r\nb', '`a b`'],
+    ['Name\r\n# Injected', '`Name # Injected`'],
+    [`a${LS}b${PS}\nc`, '`a b c`'],
+  ])('flattens the line breaks in %j to one space', (text, expected) => {
+    expect(codeSpan(text)).toBe(expected);
+  });
+
+  it('renders empty text as nothing', () => {
+    expect(codeSpan('')).toBe('');
+  });
+
+  it.each(MARKUP)('renders %j verbatim in a heading, a bold label, and a list item', (text) => {
+    const span = codeSpan(text);
+    const heading = render(`# A000001: ${span}`).html;
+    expect(headings(heading)).toEqual([`h1 A000001: ${text}`]);
+    expect(codeTexts(heading)).toEqual([text]);
+
+    const label = render(`**Author:** ${span}`).html;
+    expect(codeTexts(label)).toEqual([text]);
+    expect(elements(label, 'strong')).toHaveLength(1);
+
+    const item = render(`- ${span} — ${codeSpan('https://e.example/u')}`).html;
+    expect(codeTexts(item)).toEqual([text, 'https://e.example/u']);
+    expect(elements(item, 'li')).toHaveLength(1);
+
+    for (const html of [heading, label, item]) {
+      for (const tag of ['a', 'img', 'em', 'del', 'ol', 'h2', 'blockquote']) {
+        expect(elements(html, tag), tag).toEqual([]);
+      }
     }
+  });
+
+  it('renders text with line breaks as its flattened line, in the slot it was given', () => {
+    const html = render(`# A000001: ${codeSpan('Name\r\n## Injected heading\n- item')}`).html;
+    expect(headings(html)).toEqual(['h1 A000001: Name ## Injected heading - item']);
+    expect(elements(html, 'li')).toEqual([]);
+    const separators = render(`# A000001: ${codeSpan(`Name${LS}line${PS}paragraph`)}`).html;
+    expect(headings(separators)).toEqual(['h1 A000001: Name line paragraph']);
+  });
+
+  it.each([
+    ['one backtick run', '`'.repeat(MIB)],
+    ['alternating backticks', '`a'.repeat(MIB / 2)],
+    ['growing backtick runs', '`a``a```a'.repeat(MIB / 9)],
+    ['backticks between line breaks', '`\r\n'.repeat(MIB / 3)],
+  ])('renders 1 MiB of %s in linear time', (_shape, text) => {
+    expect(cpuMs(() => codeSpan(text))).toBeLessThan(1_000);
+  });
+
+  it.each(SHAPES)('grows linearly on %s', (_shape, shape, from) => {
+    expectLinear(codeSpan, shape, from);
   });
 });
 
@@ -173,6 +289,31 @@ describe('fence', () => {
     expect(marker).toBe('````');
     expect(out.endsWith(`\n${marker}`)).toBe(true);
     expect(out.slice(marker.length + 1, -(marker.length + 1))).toBe(code);
+  });
+
+  it('renders every line verbatim in one code block that no line closes', () => {
+    const code = [...MARKUP, '    indented', '~~~', '````', '</code></pre>'].join('\n');
+    const { html } = render(`## Formulas\n\n${fence(code)}\n\nAfter.`);
+    expect(codeTexts(html)).toEqual([`${code}\n`]);
+    expect(elements(html, 'pre')).toHaveLength(1);
+    expect(headings(html)).toEqual(['h2 Formulas']);
+    for (const tag of ['a', 'img', 'em', 'del', 'ul', 'ol', 'blockquote']) {
+      expect(elements(html, tag), tag).toEqual([]);
+    }
+    expect(html).toContain('<p>After.</p>');
+  });
+
+  it.each([
+    ['one backtick run', '`'.repeat(MIB)],
+    ['alternating backticks', '`a'.repeat(MIB / 2)],
+    ['growing backtick runs', '`a``a```a'.repeat(MIB / 9)],
+    ['backticks between line breaks', '`\r\n'.repeat(MIB / 3)],
+  ])('fences 1 MiB of %s in linear time', (_shape, text) => {
+    expect(cpuMs(() => fence(text))).toBeLessThan(1_000);
+  });
+
+  it.each(SHAPES)('grows linearly on %s', (_shape, shape, from) => {
+    expectLinear(fence, shape, from);
   });
 });
 
@@ -224,7 +365,7 @@ describe('summaryLines', () => {
       '**Terms:** 1, 1, 2, 5',
       '**Offset:** 0,3 (first term is a(0))',
       '**Keywords:** core, nonn',
-      '**Author:** _N. J. A. Sloane_',
+      '**Author:** `_N. J. A. Sloane_`',
       '**Legacy IDs:** M1459, N0577',
       '**Modified:** 2026-09-15T21:11:07-04:00',
       '**URL:** https://oeis.org/A000108',
@@ -240,18 +381,21 @@ describe('summaryLines', () => {
       '**URL:** https://oeis.org/A000108',
     ]);
     expect(summaryLines({ ...row, author: 'Simon P. Norton' })).toContain(
-      '**Author:** Simon P. Norton',
+      '**Author:** `Simon P. Norton`',
     );
     expect(summaryLines({ ...row, legacyIds: ['M2975'] })).toContain('**Legacy IDs:** M2975');
   });
 
-  it('escapes link, image, and HTML openers in the author and flattens its line breaks', () => {
-    const [, , , author] = summaryLines({
-      ...row,
-      author: '<a>Eve</a> [site](https://attacker.example) ![x](y)\r\n# Mallory',
-    });
-    expect(author).toBe(
-      '**Author:** \\<a>Eve\\</a> [site\\](https://attacker.example) !\\[x\\](y) # Mallory',
+  it('renders the author as written and inert, its line breaks flattened', () => {
+    const author = '<a>Eve</a> [site](https://attacker.example) ![x](y)\r\n# Mallory';
+    const [, , , line = ''] = summaryLines({ ...row, author });
+    expect(line).toBe(
+      '**Author:** `<a>Eve</a> [site](https://attacker.example) ![x](y) # Mallory`',
     );
+    const { html } = render(line);
+    expect(codeTexts(html)).toEqual([
+      '<a>Eve</a> [site](https://attacker.example) ![x](y) # Mallory',
+    ]);
+    for (const tag of ['a', 'img', 'h1']) expect(elements(html, tag), tag).toEqual([]);
   });
 });

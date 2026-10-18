@@ -7,7 +7,7 @@
 
 import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { blockquote, inline } from '@/mcp-server/shared/markdown.js';
+import { codeSpan, fence, inline } from '@/mcp-server/shared/markdown.js';
 import {
   ANumberSchema,
   blankAsUnset,
@@ -377,10 +377,10 @@ export const oeisGetCrossRefs = tool('oeis_get_cross_refs', {
     result.related.forEach((row, i) => {
       out.push(
         '',
-        `## ${result.start + i + 1}. ${row.aNumber}${row.name === undefined ? '' : `: ${inline(row.name)}`}`,
+        `## ${result.start + i + 1}. ${row.aNumber}${row.name === undefined ? '' : `: ${codeSpan(row.name)}`}`,
         `**Resolved:** ${row.resolved ? 'yes' : 'no (name and terms not fetched)'}`,
       );
-      if (row.note !== undefined) out.push(`**Note:** ${inline(row.note)}`);
+      if (row.note !== undefined) out.push(`**Note:** ${codeSpan(row.note)}`);
       if (row.lineIndex !== undefined) out.push(`**Cross-reference line:** ${row.lineIndex}`);
       if (row.terms) {
         out.push(`**Terms:** ${row.terms.length ? inline(row.terms.join(', ')) : 'none listed'}`);
@@ -390,7 +390,7 @@ export const oeisGetCrossRefs = tool('oeis_get_cross_refs', {
       if (row.keywords) {
         out.push(`**Keywords:** ${row.keywords.length ? inline(row.keywords.join(', ')) : 'none'}`);
       }
-      if (row.author !== undefined) out.push(`**Author:** ${inline(row.author)}`);
+      if (row.author !== undefined) out.push(`**Author:** ${codeSpan(row.author)}`);
       if (row.legacyIds) out.push(`**Legacy IDs:** ${inline(row.legacyIds.join(', '))}`);
       if (row.modified !== undefined) out.push(`**Modified:** ${inline(row.modified)}`);
       out.push(`**URL:** ${row.url}`);
@@ -398,7 +398,7 @@ export const oeisGetCrossRefs = tool('oeis_get_cross_refs', {
     if (result.lines) {
       out.push('', '## Cross-reference lines');
       result.lines.forEach((line, i) => {
-        out.push('', `Line ${i}:`, blockquote(line));
+        out.push('', `Line ${i}:`, fence(line));
       });
       if (!result.lines.length) out.push('', 'None.');
     }

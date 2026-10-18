@@ -33,6 +33,7 @@ import {
   reservedRecordJson,
   searchPageText,
 } from '../fixtures/oeis-upstream.js';
+import { codeTexts, elements, headings, render } from '../fixtures/rendered-markdown.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, queryOf, serviceOver, withBackoff } from '../fixtures/tool-service.js';
 
@@ -551,8 +552,8 @@ describe('oeis_get_sequence', () => {
     });
 
     it('fills each cut part to within one item of the budget', async () => {
-      // Each item costs 2,007 bytes: 1,003 of JSON (the string and its comma) and 1,004 of text
-      // ("\n\n> " and the line), so a part filled as far as it goes leaves less than that unused.
+      // Each item costs 2,004 bytes: 1,003 of JSON (the string and its comma) and 1,001 of text
+      // (the line and its "\n" in the fence), so a part filled as far as it goes leaves less unused.
       const raw = recordWith(
         { comment: Array.from({ length: 150 }, () => 'x'.repeat(1_000)) },
         minimalRecordJson,
@@ -561,7 +562,7 @@ describe('oeis_get_sequence', () => {
       expect(pages).toHaveLength(4);
       expectCompleteWalk(pages, raw, ['comments']);
       for (const page of pages.slice(0, -1)) {
-        expect(BUDGET - responseBytes(page)).toBeLessThan(2_007);
+        expect(BUDGET - responseBytes(page)).toBeLessThan(2_004);
       }
     });
 
@@ -918,7 +919,9 @@ describe('oeis_get_sequence', () => {
       expect(text.toLowerCase()).not.toContain('javascript:');
       expect(text).not.toContain('data:text');
       expect(text).not.toContain('mailto:');
-      expect(text).toContain('- js\n');
+      expect(text).toContain('- `js`\n');
+      // The one link a renderer makes is GFM's autolink of the entry's own URL line.
+      expect(elements(render(text).html, 'a')).toEqual(['<a href="https://oeis.org/A000045">']);
     });
 
     it('does not let a dropped javascript: href become the b-file URL', async () => {
@@ -1160,10 +1163,18 @@ describe('oeis_get_sequence', () => {
       }
     });
 
-    it('renders comment-like sections as one blockquote per line and examples and programs as fences', async () => {
+    it('renders each line section as one fence, one line per item, and each program as its own fence', async () => {
       const { result } = await fetchSequence({ aNumber: 'A45' }, ok());
+      const out = structured(result) as SequenceShape;
       const text = textOf(result);
-      expect(text).toContain("## Comments\n\n> Also sometimes called Lamé's sequence.");
+      expect(out.comments).toHaveLength(2);
+      expect(text).toContain(`## Comments\n\n\`\`\`\n${out.comments.join('\n')}\n\`\`\``);
+      expect(text).toContain(
+        '## Formulas\n\n```\nG.f.: x/(1 - x - x^2).\na(n) = a(n-1) + a(n-2) for n >= 2.\n```',
+      );
+      expect(text).toContain(
+        '## Cross-references\n\n```\nCf. A000032, A001045.\nRow sums of A011973.\n```',
+      );
       expect(text).toContain('## Examples\n\n```\nF(5) = 5 = F(4) + F(3) = 3 + 2.\n```');
       expect(text).toContain(
         '### Python\n\n```\nfrom sympy import fibonacci\ndef a(n): return fibonacci(n)\n```',
@@ -1193,17 +1204,19 @@ describe('oeis_get_sequence', () => {
       expect(result.isError).toBeUndefined();
       const lines = textOf(result).split('\n');
       let fenced = false;
+      const insideFences: string[] = [];
       const outsideFences = lines.filter((line) => {
         if (line.startsWith('```')) {
           fenced = !fenced;
           return false;
         }
+        if (fenced) insideFences.push(line);
         return !fenced;
       });
       expect(fenced).toBe(false);
       // Outside fences, the only heading-shaped lines are the tool's own.
       expect(outsideFences.filter((line) => /^#{1,6} /.test(line))).toEqual([
-        '# A000045: Name ## Injected heading # Another',
+        '# A000045: `Name ## Injected heading # Another`',
         '## Comments',
         '## Formulas',
         '## Examples',
@@ -1222,16 +1235,32 @@ describe('oeis_get_sequence', () => {
       );
       expect(inlineSlots).toHaveLength(5);
       for (const slot of inlineSlots) expect(slot).toContain('Injected heading');
-      expect(lines.find((line) => line.startsWith('- Link text'))).toContain('Injected heading');
-      for (const section of ['Comment line', 'Formula', 'Reference', 'Xref', 'Ext']) {
-        expect(lines).toContain(`> ${section}`);
+      expect(lines.find((line) => line.startsWith('- `Link text'))).toContain('Injected heading');
+      // The six line sections and the Maple block keep the lines verbatim inside their fences.
+      for (const section of ['Comment line', 'Formula', 'Example', 'Reference', 'Xref', 'Ext']) {
+        expect(insideFences).toContain(`${section}\r`);
       }
-      expect(lines.filter((line) => line === '> ## Injected heading')).toHaveLength(5);
-      expect(lines.filter((line) => line === '> # Another')).toHaveLength(5);
+      expect(insideFences.filter((line) => line === '## Injected heading')).toHaveLength(7);
+      expect(insideFences.filter((line) => line === '# Another')).toHaveLength(7);
+      expect(headings(render(textOf(result)).html)).toEqual([
+        'h1 A000045: Name ## Injected heading # Another',
+        'h2 Comments',
+        'h2 Formulas',
+        'h2 Examples',
+        'h2 Programs',
+        'h3 Maple',
+        'h3 Mathematica',
+        'h3 PARI',
+        'h3 Python',
+        'h2 References',
+        'h2 Links',
+        'h2 Cross-references',
+        'h2 Extensions',
+      ]);
       expect(structured(result).name).toBe(`Name${inject}`);
     });
 
-    it('escapes link, image, and HTML syntax in contributor text and keeps structuredContent verbatim', async () => {
+    it('renders link, image, and HTML syntax in contributor text as inert text and keeps structuredContent verbatim', async () => {
       const raw = recordWith({
         name: 'Evil ![beacon](https://attacker.example/b.png) [docs](https://attacker.example/x) <img src=x onerror=alert(1)>',
         author: '_Evil_ <iframe src="javascript:alert(3)"></iframe>',
@@ -1248,20 +1277,30 @@ describe('oeis_get_sequence', () => {
       const { result } = await fetchSequence({ aNumber: 'A45' }, ok(raw));
       const text = textOf(result);
       expect(text).toContain(
-        '# A000045: Evil !\\[beacon\\](https://attacker.example/b.png) [docs\\](https://attacker.example/x) \\<img src=x onerror=alert(1)>',
+        '# A000045: `Evil ![beacon](https://attacker.example/b.png) [docs](https://attacker.example/x) <img src=x onerror=alert(1)>`',
       );
-      expect(text).toContain('**Author:** _Evil_ \\<iframe src="javascript:alert(3)">\\</iframe>');
+      expect(text).toContain('**Author:** `_Evil_ <iframe src="javascript:alert(3)"></iframe>`');
       expect(text).toContain(
-        '> [harmless-looking\\](javascript:alert(4)) \\<img src="https://attacker.example/c.png">',
+        '- `Sloane, <img src=x onerror=alert(6)> and <a href="https://attacker.example">x</a>`\n',
       );
-      expect(text).toContain('> a(n) = [x^n] 1/(1 - x - x^2) < 2^n.');
-      expect(text).toContain(
-        '- Sloane, \\<img src=x onerror=alert(6)> and \\<a href="https://attacker.example">x\\</a>\n',
-      );
-      expect(text).toContain('> Cf. A000032 (see [here\\](https://attacker.example/n)).');
-      expect(text).toContain('> \\[ref]: https://attacker.example/def');
 
       const out = structured(result);
+      const rendered = render(text);
+      for (const value of [
+        raw.name,
+        raw.author,
+        ...(raw.comment as string[]),
+        ...(raw.formula as string[]),
+        'Sloane, <img src=x onerror=alert(6)> and <a href="https://attacker.example">x</a>',
+        ...(raw.xref as string[]),
+        ...(raw.ext as string[]),
+      ] as string[]) {
+        expect(rendered.text, value).toContain(value);
+      }
+      expect(rendered.html).not.toContain('attacker.example"');
+      for (const tag of ['img', 'iframe', 'em']) expect(elements(rendered.html, tag)).toEqual([]);
+      expect(elements(rendered.html, 'a')).toEqual(['<a href="https://oeis.org/A000045">']);
+
       expect(out.name).toBe(raw.name);
       expect(out.author).toBe(raw.author);
       expect(out.comments).toEqual(raw.comment);
@@ -1301,7 +1340,7 @@ describe('oeis_get_sequence', () => {
         links: [{ text: 't', urls: ['https://example.org/a``b', 'https://example.org/`c'] }],
       });
       const text = blocksText(blocks);
-      expect(text).toContain('- t — ```https://example.org/a``b``` ``https://example.org/`c``');
+      expect(text).toContain('- `t` — ```https://example.org/a``b``` ``https://example.org/`c``');
     });
 
     it('percent-encodes a backtick in a link URL, so none survives normalization', async () => {
@@ -1328,9 +1367,164 @@ describe('oeis_get_sequence', () => {
         url: 'https://oeis.org/A000001',
       });
       const text = blocksText(blocks);
-      expect(text).toContain('# A000001: Core only.');
+      expect(text).toContain('# A000001: `Core only.`');
       expect(text).not.toContain('## Comments');
       expect(blocks).toHaveLength(1);
     });
   });
+
+  describe('content[] as a markdown renderer shows it', () => {
+    /** The tool's own headings: the entry heading, a section heading, or a program language. */
+    const OWN_HEADING = new RegExp(
+      `^(h1 A\\d{6}: .*|h2 (${Object.values(HEADINGS).join('|')})|h3 .*)$`,
+    );
+
+    it('renders every A000108 formula verbatim, with no emphasis or strikethrough', async () => {
+      const { result } = await fetchSequence(
+        { aNumber: 'A000108', sections: ['formulas'] },
+        ok(catalanRecordJson),
+      );
+      const { html, text } = render(textOf(result));
+      expect(text).toContain(
+        'a(n) = binomial(2*n, n)/(n+1) = (2*n)!/(n!*(n+1)!) = A000984(n)/(n+1).',
+      );
+      const formulas = structured(result).formulas as string[];
+      expect(formulas).toHaveLength(99);
+      for (const formula of formulas) expect(text, formula).toContain(formula);
+      expect(codeTexts(html)).toContain(`${formulas.join('\n')}\n`);
+      expect(elements(html, 'em')).toEqual([]);
+      expect(elements(html, 'del')).toEqual([]);
+    });
+
+    it('renders the name, author, and every A000108 section item verbatim across a walk of all eight sections', async () => {
+      const { pages } = await walkSelection(catalanRecordJson, 'A000108', SECTION_NAMES);
+      const record = normalizeRecord(catalanRecordJson);
+      const parts = pages.map((page) => render(textOf(page)));
+      for (const [i, { html, text }] of parts.entries()) {
+        expect(headings(html)[0]).toBe(`h1 A000108: ${record.name}`);
+        expect(text).toContain(String(record.author));
+        // Each line section in this part is one fence holding exactly this part's items.
+        const part = structured(pages[i] as Result) as Record<string, unknown>;
+        for (const section of [
+          'comments',
+          'formulas',
+          'examples',
+          'references',
+          'crossReferences',
+          'extensions',
+        ]) {
+          const lines = part[section] as string[] | undefined;
+          if (lines?.length) expect(codeTexts(html), section).toContain(`${lines.join('\n')}\n`);
+        }
+        for (const tag of ['em', 'del', 'img']) expect(elements(html, tag), tag).toEqual([]);
+        // GFM autolinks the entry's own URL and b-file lines; nothing contributor-written links.
+        expect(elements(html, 'a')).toEqual([
+          `<a href="${record.url}">`,
+          `<a href="${String(record.bFileUrl)}">`,
+        ]);
+        for (const heading of headings(html)) expect(heading).toMatch(OWN_HEADING);
+      }
+      const seen = parts.map(({ text }) => text).join('\n');
+      for (const item of [
+        ...record.comments,
+        ...record.formulas,
+        ...record.examples,
+        ...record.references,
+        ...record.links.map((link) => link.text),
+        ...record.crossReferences,
+        ...record.extensions,
+        ...record.programs.map((program) => program.code),
+      ]) {
+        expect(seen, item).toContain(item);
+      }
+    });
+
+    it('renders contributor markup and backtick runs verbatim and inert, keeping structuredContent verbatim', async () => {
+      const markup = [
+        '[x](https://e.example)',
+        '![i](https://e.example/i.png)',
+        '<img src=x>',
+        '`1234, `2`134, `23`14',
+        '```',
+        'n! = 1*2*3*4*...*n ~~struck~~ _under_ \\*kept\\*',
+      ].join(' ');
+      const raw = recordWith({
+        name: `# ${markup}`,
+        author: `1. ${markup}`,
+        comment: [
+          `- ${markup}`,
+          '[ref]: https://e.example',
+          '# not a heading',
+          '```',
+          '1. not a list',
+        ],
+        formula: [`a(n) = [x^n] 1/(1 - x - x^2) < 2^n; ${markup}`, '[ref]: https://e.example'],
+        reference: [`- ${markup}`],
+        link: [`${markup} &lt;img src=x&gt;`, '[ref]: https://e.example'],
+        xref: [`Cf. A000032 (see ${markup}).`],
+        ext: ['[ref]: https://e.example', `# ${markup}`],
+      });
+      const { result } = await fetchSequence({ aNumber: 'A45' }, ok(raw));
+      const out = structured(result) as SequenceShape;
+      const { html, text } = render(textOf(result));
+
+      for (const value of [
+        out.name,
+        out.author,
+        ...out.comments,
+        ...out.formulas,
+        ...out.references,
+        ...out.links.map((link) => link.text),
+        ...out.crossReferences,
+        ...out.extensions,
+      ]) {
+        expect(text, value).toContain(value);
+      }
+      expect(html).not.toMatch(/(?:href|src)="[^"]*e\.example/);
+      for (const tag of ['em', 'del', 'img', 'ol', 'blockquote']) {
+        expect(elements(html, tag), tag).toEqual([]);
+      }
+      expect(elements(html, 'a')).toEqual(['<a href="https://oeis.org/A000045">']);
+      expect(headings(html)).toEqual([
+        `h1 A000045: ${out.name}`,
+        'h2 Comments',
+        'h2 Formulas',
+        'h2 Examples',
+        'h2 Programs',
+        'h3 Maple',
+        'h3 Mathematica',
+        'h3 PARI',
+        'h3 Python',
+        'h2 References',
+        'h2 Links',
+        'h2 Cross-references',
+        'h2 Extensions',
+      ]);
+      expect(elements(html, 'li')).toHaveLength(out.links.length);
+
+      expect(out.name).toBe(raw.name);
+      expect(out.author).toBe(raw.author);
+      expect(out.comments).toEqual(raw.comment);
+      expect(out.formulas).toEqual(raw.formula);
+      // A link line is HTML, so its literal tag is stripped and its encoded one decoded.
+      expect(out.links).toEqual([
+        { text: `${markup.replace('<img src=x>', '')} <img src=x>`, urls: [] },
+        { text: '[ref]: https://e.example', urls: [] },
+      ]);
+      expect(out.crossReferences).toEqual(raw.xref);
+      expect(out.extensions).toEqual(raw.ext);
+    });
+  });
 });
+
+/** The parts of a full output the rendering tests read. */
+type SequenceShape = {
+  author: string;
+  comments: string[];
+  crossReferences: string[];
+  extensions: string[];
+  formulas: string[];
+  links: { text: string; urls: string[] }[];
+  name: string;
+  references: string[];
+};

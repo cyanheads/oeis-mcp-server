@@ -111,7 +111,7 @@ const REFERENCE: Record<Topic, ReferenceTable> = {
       {
         name: 'seq:',
         description:
-          'Terms in this order, consecutively, ignoring signs, e.g. seq:1,2,5,14,42. Bare comma-separated numbers are read as seq:.',
+          'Terms in this order, consecutively, ignoring signs, e.g. seq:1,2,5,14,42. Bare numbers separated by commas are read as seq:; with spaces alone, a negative term after the first starts a new run and fewer than three numbers are not joined, so 14 42 is two separate searches.',
       },
       { name: 'signed:', description: 'Like seq:, but the signs must match too.' },
       {

@@ -7,7 +7,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { DATA_LINE_SENTENCE, likelyPastDataLine } from '@/mcp-server/shared/data-line-limit.js';
-import { inline, summaryLines } from '@/mcp-server/shared/markdown.js';
+import { codeSpan, summaryLines } from '@/mcp-server/shared/markdown.js';
 import {
   blankAsUnset,
   MAX_START,
@@ -49,13 +49,53 @@ const KNOWN_PREFIXES = new Set([
   'extension',
 ]);
 
-const NUMBERS_ONLY = /^-?\d+(?:[\s,]+-?\d+)*$/;
+/** One token of the `Search:` echo: a quoted phrase, other non-space text, or a lone `"`. */
+const ECHO_TOKEN = /"[^"]*"|[^\s"]+|"/g;
 /**
- * The `Search:` echo of a query OEIS matched as one run of consecutive terms. Bare numbers come back
- * as `seq:` with the terms joined by commas, except numbers separated only by spaces with a negative
- * among them, which OEIS splits apart.
+ * An echo token that holds terms: `seq:` or `signed:` and terms (integers or `_`) joined by commas,
+ * or a bare integer. OEIS echoes bare numbers separated by commas as one `seq:` run; with spaces
+ * alone, a negative term after the first starts a new run and a run of fewer than three numbers is
+ * left unjoined (`14 42` → `14 42`, `1 2 -5 14 42 132` → `1 2 seq:-5,14,42,132`).
  */
-const TERM_RUN = /^(?:seq|signed):(-?\d+(?:,-?\d+)*)$/;
+const TERM_TOKEN = /^(?:(seq|signed):((?:-?\d+|_)(?:,(?:-?\d+|_))*)|-?\d+)$/;
+
+/** What OEIS's `Search:` echo shows about the numbers in a query. */
+export interface EchoReading {
+  /** Set when that one token is a bare integer, which OEIS matches in an entry's text as well. */
+  bare?: true;
+  /** The terms, when the whole echo is one token holding terms: OEIS matched them as one run. */
+  run?: string[];
+  /** Guidance, when two tokens holding terms are adjacent: OEIS searched them as separate runs. */
+  splitNotice?: string;
+}
+
+/**
+ * Reads the echo token by token, a quoted phrase counting as one: a single token holding terms is
+ * the run OEIS matched; two adjacent ones are numbers OEIS split apart. The split notice gives the
+ * echo's terms joined by commas, `signed:` first when the first token is, as the one-run query to
+ * send instead, unless the echo holds another token (a word, a phrase, another prefix).
+ */
+export function readEcho(effectiveQuery: string): EchoReading {
+  const tokens = (effectiveQuery.match(ECHO_TOKEN) ?? []).map((token) => {
+    const [whole, prefix, terms] = TERM_TOKEN.exec(token) ?? [];
+    return whole === undefined
+      ? undefined
+      : {
+          bare: prefix === undefined,
+          signed: prefix === 'signed',
+          terms: terms?.split(',') ?? [whole],
+        };
+  });
+  const [first] = tokens;
+  if (tokens.length === 1 && first) return { run: first.terms, ...(first.bare && { bare: true }) };
+  if (!tokens.some((token, i) => token && tokens[i + 1])) return {};
+  const run = tokens.every((token) => token !== undefined)
+    ? `: "${first?.signed ? 'signed:' : ''}${tokens.flatMap((token) => token.terms).join(',')}"`
+    : '';
+  return {
+    splitNotice: `OEIS split these numbers into separate searches (see effectiveQuery): with spaces alone, a negative term starts a new run and fewer than three numbers are not joined. To search them as one run, separate them with commas${run}.`,
+  };
+}
 
 /** `word:` prefixes in the query that OEIS does not recognize; quoted phrases are skipped. */
 function unknownPrefixes(query: string): string[] {
@@ -70,10 +110,12 @@ function unknownPrefixes(query: string): string[] {
 /**
  * Composes the zero-hit guidance from the conditions that hold for the query. The requested start
  * plays no part: OEIS serves the last page for a start past the end, so "No results." at any
- * start means the query matches nothing. A query OEIS echoes as one `seq:` or `signed:` run is
- * matched as `oeis_identify_sequence` matches its terms, so it is held to the same data-line limit.
+ * start means the query matches nothing. A query OEIS echoes as one run of terms is matched as
+ * `oeis_identify_sequence` matches its terms, so it is held to the same data-line limit, except a
+ * lone bare integer, which OEIS also matches in an entry's text; numbers OEIS split apart get the
+ * split notice in place of that advice, which would still split.
  */
-function zeroHitNotice(query: string, effectiveQuery: string): string {
+function zeroHitNotice(query: string, echo: EchoReading): string {
   const parts: string[] = [];
   const unknown = unknownPrefixes(query);
   if (unknown.length) {
@@ -85,9 +127,9 @@ function zeroHitNotice(query: string, effectiveQuery: string): string {
       'oeis_list_reference topic search_syntax lists the valid prefixes.',
     );
   }
-  const run = TERM_RUN.exec(effectiveQuery)?.[1];
-  if (run !== undefined && likelyPastDataLine(run.split(','))) parts.push(DATA_LINE_SENTENCE);
-  if (run !== undefined || NUMBERS_ONLY.test(query)) {
+  if (echo.splitNotice) parts.push(echo.splitNotice);
+  else if (echo.run) {
+    if (!echo.bare && likelyPastDataLine(echo.run)) parts.push(DATA_LINE_SENTENCE);
     parts.push(
       'Drop the first term or two and retry, since sources disagree on where a sequence starts; or put subseq: before the terms to match them with other terms in between.',
     );
@@ -112,7 +154,7 @@ export const oeisSearchSequences = tool('oeis_search_sequences', {
       .min(1)
       .max(1000)
       .describe(
-        'OEIS query, sent as written. Examples: keyword:core fibonacci; author:Sloane; "Catalan numbers" (a quoted phrase); 1,2,5,14,42. oeis_list_reference topic search_syntax lists the prefixes and operators.',
+        'OEIS query, sent as written. Examples: keyword:core fibonacci; author:Sloane; "Catalan numbers" (a quoted phrase); 1,2,5,14,42 (separate terms with commas: with spaces alone, a negative term after the first starts a new run and fewer than three numbers are not joined). oeis_list_reference topic search_syntax lists the prefixes and operators.',
       ),
     sort: blankAsUnset(z.enum(SORT_ORDERS).default('relevance')).describe(
       'Result order: relevance (default), number (ascending A-number), created (newest entry first), or modified (most recently edited first).',
@@ -136,7 +178,15 @@ export const oeisSearchSequences = tool('oeis_search_sequences', {
       .describe('Pass as start for the next page; absent on the last reachable page.'),
     sort: z.enum(SORT_ORDERS).describe('The result order applied.'),
   }),
-  enrichment: pagedListEnrichment,
+  enrichment: {
+    ...pagedListEnrichment,
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance: why nothing matched; that OEIS split the numbers into separate searches, and how to join them with commas into one run; how to narrow the query; or how to reach the next page.',
+      ),
+  },
   errors: [
     {
       reason: 'pacer_shed',
@@ -168,6 +218,7 @@ export const oeisSearchSequences = tool('oeis_search_sequences', {
     if (page.total !== undefined) ctx.enrich.total(page.total);
     ctx.enrich({ shown: page.rows.length });
     const start = page.start ?? input.start;
+    const echo = readEcho(page.effectiveQuery);
 
     const notices: string[] = [];
     if (start < input.start) {
@@ -175,7 +226,8 @@ export const oeisSearchSequences = tool('oeis_search_sequences', {
         `Start ${input.start} is past the last of ${page.total} results; this is the last page, from start ${start}.`,
       );
     }
-    if (page.status === 'none') notices.push(zeroHitNotice(input.query, page.effectiveQuery));
+    if (page.status === 'none') notices.push(zeroHitNotice(input.query, echo));
+    else if (echo.splitNotice) notices.push(echo.splitNotice);
     if (page.status === 'too_many') {
       notices.push(
         'OEIS matched too many entries to list. Add a word, a quoted phrase, or a prefix such as keyword:nice or author:<name>.',
@@ -211,7 +263,7 @@ export const oeisSearchSequences = tool('oeis_search_sequences', {
     const lines = [`# OEIS search results (start ${result.start}, sort ${result.sort})`];
     if (!result.results.length) lines.push('', 'No sequences on this page.');
     result.results.forEach((row, i) => {
-      lines.push('', `## ${result.start + i + 1}. ${row.aNumber}: ${inline(row.name)}`);
+      lines.push('', `## ${result.start + i + 1}. ${row.aNumber}: ${codeSpan(row.name)}`);
       lines.push(...summaryLines(row));
     });
     if (result.nextStart !== undefined) {

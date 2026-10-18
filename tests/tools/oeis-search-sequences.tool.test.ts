@@ -2,8 +2,9 @@
  * @fileoverview Tests for oeis_search_sequences through the tool contract over a real OeisService
  * with a scripted fetch: query/sort/start input and blank form-client values, the query sent
  * upstream, paging to start 100 and the result-window refusal past it, the zero-hit, unknown-prefix,
- * too-many, and start-past-total notices, required enrichment on the zero-result and under-cap
- * pages, upstream failure classes, and `format()` parity with `structuredContent`.
+ * split-run, too-many, and start-past-total notices, required enrichment on the zero-result and
+ * under-cap pages, upstream failure classes, `format()` parity with `structuredContent`, and the
+ * linear-time reading of OEIS's `Search:` echo.
  * @module tests/tools/oeis-search-sequences.tool.test
  */
 
@@ -11,11 +12,18 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { createPacer } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { oeisSearchSequences } from '@/mcp-server/tools/definitions/oeis-search-sequences.tool.js';
-import { OeisService } from '@/services/oeis/oeis-service.js';
 import {
+  oeisSearchSequences,
+  readEcho,
+} from '@/mcp-server/tools/definitions/oeis-search-sequences.tool.js';
+import { OeisService } from '@/services/oeis/oeis-service.js';
+import { cpuMs } from '../fixtures/cpu-time.js';
+import {
+  capturedEcho,
   capturedSearchRecords,
   clampedSearchPage,
+  type EchoCaptureQuery,
+  echoCapturePage,
   htmlMaintenanceBody,
   moebiusSearchRecord,
   noResultsSearchPage,
@@ -24,8 +32,10 @@ import {
   searchPageText,
   signInRefusalBody,
   syntheticSearchPage,
+  syntheticSearchRecords,
   tooManySearchPage,
 } from '../fixtures/oeis-upstream.js';
+import { elements, headings, render } from '../fixtures/rendered-markdown.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, queryOf, serviceOver, withBackoff } from '../fixtures/tool-service.js';
 
@@ -269,13 +279,13 @@ describe('oeis_search_sequences', () => {
       expect(sections[0]).toContain(
         [
           '**Keywords:** nonn, core, nice, easy, hear, changed',
-          '**Author:** _N. J. A. Sloane_, 1964',
+          '**Author:** `_N. J. A. Sloane_, 1964`',
           '**Legacy IDs:** M0692, N0256',
           '**Modified:** 2026-09-23T16:08:09-04:00',
           '**URL:** https://oeis.org/A000045',
         ].join('\n'),
       );
-      expect(sections[1]).toContain('**Author:** _Benjamin Simon Strang_, Aug 23 2026');
+      expect(sections[1]).toContain('**Author:** `_Benjamin Simon Strang_, Aug 23 2026`');
       expect(sections[1]).not.toContain('**Legacy IDs:**');
       for (const [i, row] of [reserved, recycled].entries()) {
         expect(sections[i + 2]).toContain(`**Modified:** ${row?.modified}`);
@@ -410,6 +420,10 @@ describe('oeis_search_sequences', () => {
     const SYNTAX = 'oeis_list_reference topic search_syntax lists the valid prefixes.';
     const NUMBERS =
       'Drop the first term or two and retry, since sources disagree on where a sequence starts; or put subseq: before the terms to match them with other terms in between.';
+    const SPLIT =
+      'OEIS split these numbers into separate searches (see effectiveQuery): with spaces alone, a negative term starts a new run and fewer than three numbers are not joined. To search them as one run, separate them with commas';
+    /** The split notice: it ends with the comma-joined run when every token of the echo holds terms. */
+    const splitNotice = (run?: string) => (run === undefined ? `${SPLIT}.` : `${SPLIT}: "${run}".`);
 
     it('answers an ordinary miss with the loosening advice alone', async () => {
       expect(await noticeFor({ query: 'zzzz qqqq' })).toBe(LOOSEN);
@@ -454,10 +468,18 @@ describe('oeis_search_sequences', () => {
       expect(await noticeFor({ query: 'a1:b' })).toBe(LOOSEN);
     });
 
-    it.each(['1,2,3', '1 2 3', '-1, 2, -3', '42'])(
-      'answers a numbers-only query %j with term-run advice, not a pointer to identify',
-      async (query) => {
-        expect(await noticeFor({ query })).toBe(NUMBERS);
+    it.each([
+      ['1,2,3', 'seq:1,2,3'],
+      ['1 2 3', 'seq:1,2,3'],
+      ['-1, 2, -3', 'seq:-1,2,-3'],
+      ['42', '42'],
+      // OEIS matches a lone bare number in an entry's text too, so it gets no data-line sentence.
+      ['739104628351907', '739104628351907'],
+    ])(
+      'answers a numbers-only query %j, echoed %j, with term-run advice, not a pointer to identify',
+      async (query, echo) => {
+        const noHits = searchPageText({ query: echo, status: 'No results.' });
+        expect(await noticeFor({ query }, noHits)).toBe(NUMBERS);
       },
     );
 
@@ -470,7 +492,12 @@ describe('oeis_search_sequences', () => {
       expect(await noticeFor({ query: 'foo:1', start: 20 })).toBe(
         `"foo:" is not an OEIS prefix, so OEIS searched it as plain words. ${SYNTAX}`,
       );
-      expect(await noticeFor({ query: '1,2,3', start: 10 })).toBe(NUMBERS);
+      expect(
+        await noticeFor(
+          { query: '1,2,3', start: 10 },
+          searchPageText({ query: 'seq:1,2,3', status: 'No results.' }),
+        ),
+      ).toBe(NUMBERS);
     });
 
     it('reports a too-many page with the narrowing advice and no rows', async () => {
@@ -594,15 +621,6 @@ describe('oeis_search_sequences', () => {
         },
       );
 
-      it('leaves the sentence out when OEIS splits spaced numbers apart at a negative term', async () => {
-        // OEIS echoes `1 -1 -1 0 -1 1 -1 0 0 1` as `1 seq:-1 seq:-1 0 seq:-1 1 seq:-1,0,0,1`.
-        await zeroHitNotice(
-          { query: '-6227020801 87178291200 -1307674368000 20922789888000' },
-          NUMBERS,
-          'seq:-6227020801 87178291200 seq:-1307674368000 20922789888000',
-        );
-      });
-
       it('names the data line from 271 characters joined with commas', async () => {
         const query = `${fourDigit(53, ' ')} 100000`;
         expect(query.replaceAll(' ', ',')).toHaveLength(271);
@@ -614,20 +632,35 @@ describe('oeis_search_sequences', () => {
       });
 
       it.each([
-        ['a subseq: prefix', `subseq:${F60_64.replaceAll(' ', ',')}`, LOOSEN],
-        ['a word', `fibonacci ${F60_64}`, LOOSEN],
-        ['a _ wildcard', `_ ${F60_64}`, LOOSEN],
+        ['a subseq: prefix', `subseq:${F60_64.replaceAll(' ', ',')}`, undefined, LOOSEN],
+        // A word ahead of the numbers leaves them to the spacing rule: `mobius 1 seq:-1 …`.
+        ['a word', `fibonacci ${F60_64}`, `fibonacci ${seqEcho(F60_64)}`, LOOSEN],
         [
           'an unknown prefix',
-          `foo:${F60_64}`,
+          `foo:${F60_64.replaceAll(' ', ',')}`,
+          undefined,
           `"foo:" is not an OEIS prefix, so OEIS searched it as plain words. ${SYNTAX}`,
         ],
       ])(
         'never adds the sentence to a large-term query with %s',
-        async (_case, query, expected) => {
-          await zeroHitNotice({ query }, expected, query);
+        async (_case, query, echo, expected) => {
+          await zeroHitNotice({ query }, expected, echo ?? query);
         },
       );
+
+      it('names the data line before the term-run advice for a wildcard run OEIS echoes as one seq: run', async () => {
+        const query = '190392490709135 _ 498454011879264 _ 1304969544928657';
+        await zeroHitNotice({ query }, PAST_DATA_LINE, capturedEcho(query));
+      });
+
+      it('names the data line for a run that opens with a _ wildcard, which OEIS drops from the echo', async () => {
+        const query = `_ ${F60_64}`;
+        await zeroHitNotice({ query }, PAST_DATA_LINE, capturedEcho(query));
+      });
+
+      it('gives the term-run advice without the sentence to a wildcard run of small terms', async () => {
+        await zeroHitNotice({ query: '1 1 _ 3 5 8' }, NUMBERS, capturedEcho('1 1 _ 3 5 8'));
+      });
 
       it('adds no zero-hit text to a large-term numbers-only query that hits', async () => {
         const { result } = await search(
@@ -641,6 +674,132 @@ describe('oeis_search_sequences', () => {
         expect(structured(tooMany.result).notice).toBe(
           'OEIS matched too many entries to list. Add a word, a quoted phrase, or a prefix such as keyword:nice or author:<name>.',
         );
+      });
+    });
+
+    describe('numbers OEIS splits into separate searches', () => {
+      const MOEBIUS_RUN = '1,-1,-1,0,-1,1,-1,0,0,1';
+      const TOO_MANY =
+        'OEIS matched too many entries to list. Add a word, a quoted phrase, or a prefix such as keyword:nice or author:<name>.';
+      const paging = (total: number) =>
+        `Showing 1-10 of ${total}; call again with start 10 for the next page.`;
+
+      /**
+       * Runs `query` against the page OEIS served for it and asserts `expected` (or no notice) on
+       * structuredContent and in the content[] trailer.
+       */
+      async function captured(query: EchoCaptureQuery, expected: string | undefined) {
+        const { result } = await search({ query }, page(echoCapturePage(query)));
+        expect(result.isError).toBeUndefined();
+        expect(structured(result).effectiveQuery).toBe(capturedEcho(query));
+        expect(structured(result).notice).toBe(expected);
+        if (expected === undefined) expect(textOf(result)).not.toContain('OEIS split');
+        else expect(textOf(result)).toContain(`> ${expected}`);
+        return result;
+      }
+
+      it('names the split and the comma-joined run ahead of the paging text on a hit page', async () => {
+        const result = await captured(
+          '1 -1 -1 0 -1 1 -1 0 0 1',
+          `${splitNotice(MOEBIUS_RUN)} ${paging(7824)}`,
+        );
+        expect(rows(result)).toHaveLength(10);
+        expect(structured(result)).toMatchObject({
+          truncated: true,
+          totalCount: 7824,
+          nextStart: 10,
+        });
+      });
+
+      it('gives the split notice alone on a zero-hit, with neither the data-line sentence nor the term-run advice its large terms would get as one run', async () => {
+        await captured(
+          '-6227020801 87178291200 -1307674368000 20922789888000',
+          splitNotice('-6227020801,87178291200,-1307674368000,20922789888000'),
+        );
+      });
+
+      it('puts the split notice ahead of the unchanged too-many text', async () => {
+        await captured('1 -1 1 -1', `${splitNotice('1,-1,1,-1')} ${TOO_MANY}`);
+      });
+
+      it.each([
+        ['seq:1 -1 -1 0 -1 1 -1 0 0 1', MOEBIUS_RUN, 7824],
+        ['signed:1 -1 -1 0 -1 1 -1 0 0 1', `signed:${MOEBIUS_RUN}`, 7814],
+        ['1,-1,-1,0 -1 1 -1 0 0 1', MOEBIUS_RUN, 3558],
+        ['14 42', '14,42', 30017],
+        ['1 2 3 -5 6 7', '1,2,3,-5,6,7', 6967],
+        ['1 2 -5 14 42 132', '1,2,-5,14,42,132', 51],
+      ] as const)('joins every term of the echo for %j as "%s"', async (query, run, total) => {
+        await captured(query, `${splitNotice(run)} ${paging(total)}`);
+      });
+
+      it('ends without a run when the echo holds a word', async () => {
+        await captured('mobius 1 -1 -1 0 -1 1 -1 0 0 1', `${splitNotice()} ${paging(175)}`);
+      });
+
+      it.each([
+        ['1,-1,-1,0,-1,1,-1,0,0,1', 202],
+        ['1, -1, -1, 0, -1, 1, -1, 0, 0, 1', 202],
+        ['signed:1,-1,-1,0,-1,1,-1,0,0,1', 12],
+        ['1 2 5 14 42 132', 50],
+        ['-1 2 5 14 42 132', 50],
+        ['5 14 42', 126],
+        ['-42', 36344],
+        ['1 1 _ 3 5 8', 344],
+      ] as const)(
+        'adds nothing to the paging text for %j, which OEIS echoes as one run',
+        async (query, total) => {
+          await captured(query, paging(total));
+        },
+      );
+
+      it('adds no notice to the one-hit wildcard run', async () => {
+        await captured('1548008755920 _ 4052739537881 6557470319842', undefined);
+      });
+
+      it('follows the start-past-end text', async () => {
+        const lastPage = searchPageText({
+          query: capturedEcho('14 42'),
+          status: 'Showing 21-26 of 26',
+          records: syntheticSearchRecords(6),
+        });
+        const { result } = await search({ query: '14 42', start: 30 }, page(lastPage));
+        expect(structured(result).notice).toBe(
+          `Start 30 is past the last of 26 results; this is the last page, from start 20. ${splitNotice('14,42')}`,
+        );
+      });
+
+      it('precedes the result-window text at start 100', async () => {
+        const windowEnd = searchPageText({
+          query: capturedEcho('1 -1 -1 0 -1 1 -1 0 0 1'),
+          status: 'Showing 101-110 of 7824',
+          records: syntheticSearchRecords(10),
+        });
+        const { result } = await search(
+          { query: '1 -1 -1 0 -1 1 -1 0 0 1', start: 100 },
+          page(windowEnd),
+        );
+        expect(structured(result)).not.toHaveProperty('nextStart');
+        expect(structured(result).notice).toBe(
+          `${splitNotice(MOEBIUS_RUN)} OEIS lists only the first 110 of 7824 matches without an account; add a word, a quoted phrase, or a prefix to narrow the query.`,
+        );
+      });
+
+      it('follows the unknown-prefix text on a zero-hit', async () => {
+        // OEIS echoes an unknown prefix as a quoted phrase: kewyord:core → "kewyord core".
+        const noHits = searchPageText({ query: '"kewyord core" 14 42', status: 'No results.' });
+        expect(await noticeFor({ query: 'kewyord:core 14 42' }, noHits)).toBe(
+          `"kewyord:" is not an OEIS prefix, so OEIS searched it as plain words. ${SYNTAX} ${splitNotice()}`,
+        );
+      });
+
+      it.each([
+        ['numbers inside a quoted phrase', '"in 3 4 dimensions"'],
+        ['one run beside a word', 'seq:1,2,3 prime'],
+        ['numbers apart from each other', '14 prime 42'],
+      ])('adds no split notice to an echo with %s', async (_case, echo) => {
+        const noHits = searchPageText({ query: echo, status: 'No results.' });
+        expect(await noticeFor({ query: echo }, noHits)).toBe(LOOSEN);
       });
     });
   });
@@ -935,15 +1094,41 @@ describe('oeis_search_sequences', () => {
       const text = textOf(result);
       expect(text).toContain('# OEIS search results (start 0, sort relevance)');
       rows(result).forEach((row, i) => {
-        expect(text).toContain(`## ${i + 1}. ${row.aNumber}: ${row.name}`);
+        expect(text).toContain(`## ${i + 1}. ${row.aNumber}: \`${row.name}\``);
         expect(text).toContain(`**Terms:** ${row.terms.join(', ')}`);
         expect(text).toContain(`**Offset:** ${row.offset} (first term is a(${row.firstIndex}))`);
         expect(text).toContain(`**Keywords:** ${row.keywords.join(', ')}`);
-        expect(text).toContain(`**Author:** ${row.author}`);
+        expect(text).toContain(`**Author:** \`${row.author}\``);
         expect(text).toContain(`**Legacy IDs:** ${row.legacyIds?.join(', ')}`);
         expect(text).toContain(`**Modified:** ${row.modified}`);
         expect(text).toContain(`**URL:** ${row.url}`);
       });
+    });
+
+    it('renders each row name and author verbatim and inert, as a markdown renderer shows them', async () => {
+      const factorial =
+        'Factorial numbers: n! = 1*2*3*4*...*n (order of symmetric group S_n, number of permutations of n letters).';
+      const hostile =
+        '1. `23`14, ``` [ref]: https://e.example [x](https://e.example) <img src=x> ~~x~~';
+      const body = searchPageText({
+        query: 'factorial',
+        status: 'Showing 1-2 of 2',
+        records: [
+          { ...moebiusSearchRecord, aNumber: 'A000142', name: factorial },
+          { ...moebiusSearchRecord, aNumber: 'A000110', name: hostile },
+        ],
+      });
+      const { result } = await search({ query: 'factorial' }, page(body));
+      expect(rows(result).map((row) => row.name)).toEqual([factorial, hostile]);
+      const { html, text } = render(textOf(result));
+      expect(headings(html)).toEqual([
+        'h1 OEIS search results (start 0, sort relevance)',
+        `h2 1. A000142: ${factorial}`,
+        `h2 2. A000110: ${hostile}`,
+      ]);
+      expect(text).toContain('Author: _N. J. A. Sloane_, Apr 30 1991');
+      for (const tag of ['em', 'del', 'img', 'ol']) expect(elements(html, tag), tag).toEqual([]);
+      expect(html).not.toMatch(/(?:href|src)="[^"]*e\.example/);
     });
 
     it('numbers ranks from start and names the sort and the next page', async () => {
@@ -953,8 +1138,8 @@ describe('oeis_search_sequences', () => {
       );
       const text = textOf(result);
       expect(text).toContain('# OEIS search results (start 20, sort created)');
-      expect(text).toContain('## 21. A100000: Synthetic 0.');
-      expect(text).toContain('## 30. A100009: Synthetic 9.');
+      expect(text).toContain('## 21. A100000: `Synthetic 0.`');
+      expect(text).toContain('## 30. A100009: `Synthetic 9.`');
       expect(text).toContain('**Next page:** call again with start 30.');
     });
 
@@ -991,13 +1176,13 @@ describe('oeis_search_sequences', () => {
         sort: 'number',
       });
       const text = blocksText(blocks);
-      expect(text).toContain('## 11. A000001: a b c');
+      expect(text).toContain('## 11. A000001: `a b c`');
       expect(text).toContain('**Terms:** 1, 2 3');
       expect(text).toContain('**Offset:** 0,1 # x (first term is a(0))');
       expect(text).toContain('**Keywords:** nonn ## y, easy');
       expect(text.split('\n').filter((line) => line.startsWith('#'))).toEqual([
         '# OEIS search results (start 10, sort number)',
-        '## 11. A000001: a b c',
+        '## 11. A000001: `a b c`',
       ]);
     });
 
@@ -1039,13 +1224,13 @@ describe('oeis_search_sequences', () => {
         [
           '# OEIS search results (start 0, sort modified)',
           '',
-          '## 1. A000045: Fibonacci numbers.',
+          '## 1. A000045: `Fibonacci numbers.`',
           '**Terms:** 0, 1, 1',
           '**Offset:** 0,4 (first term is a(0))',
           '**Keywords:** nonn, core',
           '**URL:** https://oeis.org/A000045',
           '',
-          '## 2. A397217: allocated for Jane Doe',
+          '## 2. A397217: `allocated for Jane Doe`',
           '**Terms:** none listed',
           '**Offset:** none (reserved or recycled A-number)',
           '**Keywords:** allocated',
@@ -1054,6 +1239,55 @@ describe('oeis_search_sequences', () => {
           '**Next page:** call again with start 10.',
         ].join('\n'),
       );
+    });
+  });
+
+  describe('echo reading', () => {
+    /**
+     * Asserts `readEcho` takes time linear in its input: each doubling of `shape` from `from`
+     * characters to 64 times that stays under the CPU bound before the next size is tried, and over
+     * the full span the cost grows less than 256-fold (64-fold when linear, 4,096-fold when
+     * quadratic).
+     */
+    function expectLinear(shape: (chars: number) => string, from: number) {
+      const REPEAT = 20;
+      const SAMPLES = 3;
+      const fastest: number[] = [];
+      readEcho(shape(from));
+      for (let chars = from; chars <= from * 64; chars *= 2) {
+        const echo = shape(chars);
+        const spent = Array.from({ length: SAMPLES }, () =>
+          cpuMs(() => {
+            for (let i = 0; i < REPEAT; i++) readEcho(echo);
+          }),
+        );
+        const ms = Math.min(...spent);
+        expect(ms, `${chars} characters`).toBeLessThan(1_000);
+        fastest.push(ms);
+      }
+      expect((fastest.at(-1) ?? Number.NaN) / (fastest[0] ?? Number.NaN)).toBeLessThan(256);
+    }
+
+    /**
+     * Echo shapes sized to `chars`: a digit run carries the full 64× span from 5,000 characters; the
+     * others stop at 64,000, below Bun's regex slow-mode switch.
+     */
+    it.each<[string, (chars: number) => string, number]>([
+      ['a digit run', (chars) => '9'.repeat(chars), 5_000],
+      ['a term list with no last term', (chars) => `seq:${'1,'.repeat(chars / 2)}`, 1_000],
+      ['adjacent term tokens', (chars) => '1 '.repeat(chars / 2), 1_000],
+      ['signed: runs of wildcards', (chars) => 'signed:_,-1 '.repeat(chars / 12), 1_000],
+      ['an unclosed quote', (chars) => `"${'1 '.repeat(chars / 2)}`, 1_000],
+      ['alternating quotes', (chars) => '"a'.repeat(chars / 2), 1_000],
+      ['repeated prefixes', (chars) => 'seq:'.repeat(chars / 4), 1_000],
+      ['one long line, then a line break', (chars) => `${'§1 x'.repeat(chars / 4)}\ny`, 1_000],
+      [
+        'line breaks interleaved with blank space after a term',
+        (chars) => `1${'  \r\n'.repeat(chars / 4)}`,
+        1_000,
+      ],
+    ])('reads an echo of %s in linear time', (_shape, shape, from) => {
+      expectLinear(shape, from);
     });
   });
 });

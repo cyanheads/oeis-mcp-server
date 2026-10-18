@@ -27,6 +27,7 @@ import {
   signInRefusalBody,
   tooManySearchPage,
 } from '../fixtures/oeis-upstream.js';
+import { elements, headings, render } from '../fixtures/rendered-markdown.js';
 import { res, scriptedFetch } from '../fixtures/scripted-fetch.js';
 import { blocksText, queryOf, serviceOver, withBackoff } from '../fixtures/tool-service.js';
 
@@ -443,11 +444,11 @@ describe('oeis_identify_sequence', () => {
       const [first, second] = textOf(result).split('\n\n## ').slice(1);
       expect(first).toContain('**Run starts at:** n = 2\n**Terms:** 1, 1, 2, 5, 14, 42,');
       expect(first).toContain(
-        '**Keywords:** nonn, easy\n**Author:** Simon P. Norton\n**Modified:** 2026-06-30T19:56:59-04:00\n**URL:** https://oeis.org/A033191',
+        '**Keywords:** nonn, easy\n**Author:** `Simon P. Norton`\n**Modified:** 2026-06-30T19:56:59-04:00\n**URL:** https://oeis.org/A033191',
       );
       expect(second).toContain('**Run starts at:** not located in the data line');
       expect(second).toContain(
-        '**Author:** _N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994\n**Legacy IDs:** M0082\n**Modified:** 2026-09-25T10:59:50-04:00',
+        '**Author:** `_N. J. A. Sloane_ and _Mira Bernstein_, Apr 28 1994`\n**Legacy IDs:** M0082\n**Modified:** 2026-09-25T10:59:50-04:00',
       );
     });
 
@@ -1272,9 +1273,9 @@ describe('oeis_identify_sequence', () => {
       const text = textOf(result);
       for (const row of rows(result)) {
         expect(text).toContain(row.aNumber);
-        expect(text).toContain(row.name);
+        expect(text).toContain(`: \`${row.name}\``);
         expect(text).toContain(`**Terms:** ${row.terms.join(', ')}`);
-        expect(text).toContain(`**Author:** ${row.author}`);
+        expect(text).toContain(`**Author:** \`${row.author}\``);
         expect(text).toContain(`**Legacy IDs:** ${row.legacyIds?.join(', ')}`);
         expect(text).toContain(`**Modified:** ${row.modified}`);
         expect(text).toContain(`https://oeis.org/${row.aNumber}`);
@@ -1285,6 +1286,32 @@ describe('oeis_identify_sequence', () => {
       expect(text).toContain('**Offset:** 0,3 (first term is a(0))');
       expect(text).toContain('**Keywords:** core, nonn, easy, eigen, nice, changed');
       expect(text).toContain('**Run starts at:** n = 1');
+    });
+
+    it('renders each row name and author verbatim and inert, as a markdown renderer shows them', async () => {
+      const factorial =
+        'Factorial numbers: n! = 1*2*3*4*...*n (order of symmetric group S_n, number of permutations of n letters).';
+      const hostile =
+        '- `1234, `2`134 ``` [x](https://e.example) ![i](https://e.example/i.png) <img src=x> ~~x~~';
+      const body = searchPageText({
+        query: 'seq:1,2,6,24',
+        status: 'Showing 1-2 of 2',
+        records: [
+          { ...fibonacciSearchRecord, aNumber: 'A000142', name: factorial },
+          { ...fibonacciSearchRecord, aNumber: 'A000110', name: hostile },
+        ],
+      });
+      const { result } = await identify({ terms: '1, 2, 6, 24' }, page(body));
+      expect(rows(result).map((row) => row.name)).toEqual([factorial, hostile]);
+      const { html, text } = render(textOf(result));
+      expect(headings(html)).toEqual([
+        'h1 Sequence candidates (start 0)',
+        `h2 1. A000142: ${factorial}`,
+        `h2 2. A000110: ${hostile}`,
+      ]);
+      expect(text).toContain('Author: _N. J. A. Sloane_, Apr 30 1991');
+      for (const tag of ['em', 'del', 'img', 'li']) expect(elements(html, tag), tag).toEqual([]);
+      expect(html).not.toMatch(/(?:href|src)="[^"]*e\.example/);
     });
 
     it('prints the zero-result page heading and the guidance from the enrichment block', async () => {
@@ -1311,13 +1338,13 @@ describe('oeis_identify_sequence', () => {
         start: 10,
       });
       const text = blocksText(blocks);
-      expect(text).toContain('## 11. A000001: a b c');
+      expect(text).toContain('## 11. A000001: `a b c`');
       expect(text).toContain('**Terms:** 1, 2 3');
       expect(text).toContain('**Offset:** 0,1 # x (first term is a(0))');
       expect(text).toContain('**Keywords:** nonn ## y, easy');
       expect(text.split('\n').filter((line) => line.startsWith('#'))).toEqual([
         '# Sequence candidates (start 10)',
-        '## 11. A000001: a b c',
+        '## 11. A000001: `a b c`',
       ]);
       expect(text).toContain('**Run starts at:** not located in the data line');
     });
@@ -1352,7 +1379,7 @@ describe('oeis_identify_sequence', () => {
         [
           '# Sequence candidates (start 0)',
           '',
-          '## 1. A000108: Catalan numbers.',
+          '## 1. A000108: `Catalan numbers.`',
           '**Run starts at:** n = 1',
           '**Terms:** 1, 1, 2, 5',
           '**Offset:** 0,3 (first term is a(0))',

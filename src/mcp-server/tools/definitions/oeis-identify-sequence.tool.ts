@@ -7,7 +7,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { DATA_LINE_SENTENCE, likelyPastDataLine } from '@/mcp-server/shared/data-line-limit.js';
-import { inline, summaryLines } from '@/mcp-server/shared/markdown.js';
+import { codeSpan, summaryLines } from '@/mcp-server/shared/markdown.js';
 import {
   blankAsUnset,
   MAX_START,
@@ -265,7 +265,7 @@ export const oeisIdentifySequence = tool('oeis_identify_sequence', {
     result.results.forEach((row, i) => {
       lines.push(
         '',
-        `## ${result.start + i + 1}. ${row.aNumber}: ${inline(row.name)}`,
+        `## ${result.start + i + 1}. ${row.aNumber}: ${codeSpan(row.name)}`,
         row.matchStartIndex === undefined
           ? '**Run starts at:** not located in the data line'
           : `**Run starts at:** n = ${row.matchStartIndex}`,
