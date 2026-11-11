@@ -9,6 +9,7 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
+  JsonRpcErrorCode,
   McpError,
   serviceUnavailable,
   timeout,
@@ -16,6 +17,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import {
   createPacer,
+  defaultIsTransient,
   httpErrorFromResponse,
   isRecord,
   type Pacer,
@@ -51,7 +53,7 @@ const BFILE_PAGE_BYTES = 1_048_576;
  * line measured across five large b-files was 1,004 bytes.
  */
 const BFILE_OVERLAP_BYTES = 4_096;
-/** Page reads one call may make past the first page. */
+/** Page reads one call may make to seek past the first page. */
 const BFILE_MAX_PAGE_READS = 2;
 /**
  * Sent on every b-file request. A `200` answering a stale `If-Range` otherwise comes compressed, with
@@ -208,8 +210,11 @@ async function unexpectedStatus(res: Response): Promise<McpError> {
     ...(res.status === 429 && { data: { reason: 'upstream_rate_limited' } }),
   });
   const { statusText: _reasonPhrase, ...rest } = data ?? {};
-  return new McpError(code, `OEIS returned HTTP ${res.status}.`, rest);
+  return new UnexpectedOeisStatus(code, `OEIS returned HTTP ${res.status}.`, rest);
 }
+
+/** An upstream HTTP failure, including statuses that map to a caller-input error code. */
+class UnexpectedOeisStatus extends McpError {}
 
 function headerInt(value: string | null): number | undefined {
   if (value === null) return;
@@ -599,10 +604,10 @@ export class OeisService {
 
   /**
    * Reads an entry's b-file from its canonical path. The first page, bytes 0 to 1 MiB − 1, is read on
-   * every call; when `fromIndex` lies past it in a larger file, the page holding it is read as well
-   * (see `locate`). Pages are cached for 7 days: the first under the A-number, a later one under its
-   * index and the first page's ETag, so no page ever answers for another version of the file. A
-   * miss is cached as long, unless `getRecord` drops it on a record that lists the b-file.
+   * every call. The service seeks to `fromIndex` and may read one adjacent page to fill a short
+   * slice. Pages are cached for 7 days: the first under the A-number, a later one under its index
+   * and the first page's ETag. A miss is cached as long, unless `getRecord` drops it on a record
+   * that lists the b-file.
    *
    * @returns `{ status: 'missing' }` when the entry has no b-file: OEIS answers `404`, or `200` with
    *   a file it synthesized from the data line.
@@ -610,6 +615,7 @@ export class OeisService {
    *   cached, when the first page is HTML, or is read whole and holds no pair.
    */
   async getBFile(aNumber: string, ctx: Context, options: BFileOptions = {}): Promise<BFileRead> {
+    ctx.signal.throwIfAborted();
     const startedAt = Date.now();
     const deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
     const remainingMs = () => Math.max(0, deadlineMs - (Date.now() - startedAt));
@@ -631,7 +637,7 @@ export class OeisService {
       );
       this.cacheHead(aNumber, head);
     }
-    return this.locate(aNumber, head, options.fromIndex, ctx, remainingMs);
+    return this.locate(aNumber, head, options, ctx, remainingMs);
   }
 
   /** Releases the pacer: clears its timer and rejects queued waiters. */
@@ -656,14 +662,14 @@ export class OeisService {
   private async locate(
     aNumber: string,
     head: BFileHead,
-    fromIndex: number | undefined,
+    options: BFileOptions,
     ctx: Context,
     remainingMs: () => number,
   ): Promise<BFileRead> {
     const budget = { reads: 0 };
     let current = head;
     while (true) {
-      const step = await this.searchPages(aNumber, current, fromIndex, budget, ctx, remainingMs);
+      const step = await this.searchPages(aNumber, current, options, budget, ctx, remainingMs);
       if ('answer' in step) return step.answer;
       current = step.changed;
     }
@@ -684,7 +690,7 @@ export class OeisService {
   private async searchPages(
     aNumber: string,
     head: BFileHead,
-    fromIndex: number | undefined,
+    { fromIndex, limit }: BFileOptions,
     budget: { reads: number },
     ctx: Context,
     remainingMs: () => number,
@@ -710,9 +716,72 @@ export class OeisService {
         pages.set(index, cached.value.page);
       }
     }
-    const answer = (served?: number, skippedLine = false) => ({
-      answer: this.pageRead(aNumber, read, paging, pages, served, skippedLine),
-    });
+    const answer = async (served?: number, skippedLine = false) => {
+      const first = this.pageRead(aNumber, read, paging, pages, served, skippedLine);
+      const tail = first.terms.at(-1);
+      if (limit === undefined || served === undefined || served >= lastPage || !tail) {
+        return { answer: first };
+      }
+      const begin = fromIndex === undefined ? 0 : first.terms.findIndex(({ n }) => n >= fromIndex);
+      if (begin < 0 || first.terms.length - begin >= limit) return { answer: first };
+
+      const index = served + 1;
+      const nextIndex = tail.n + 1;
+      const partial = (nextPart?: BFilePage) => ({
+        answer: {
+          ...first,
+          // A cached final part can contain malformed lines after the last known pair.
+          cut: first.cut || first.lastIndex === tail.n,
+          nextIndex,
+          nextPartUnavailable: true,
+          ...(nextPart?.malformedLines && { nextPartMalformedLines: nextPart.malformedLines }),
+          ...(nextPart?.headLost && { nextPartSkippedLine: true }),
+        } satisfies BFileOk,
+      });
+      let next: BFilePage | BFileHead | undefined = pages.get(index);
+      if (next) {
+        this.cache.get(pageKey(aNumber, index, paging.etag));
+      } else {
+        const deadlineMs = remainingMs();
+        if (deadlineMs === 0) return partial();
+        try {
+          next = await this.readPage(aNumber, paging, index, ctx, deadlineMs);
+        } catch (err) {
+          ctx.signal.throwIfAborted();
+          if (
+            !(err instanceof McpError) ||
+            (err.code !== JsonRpcErrorCode.Timeout &&
+              err.code !== JsonRpcErrorCode.RateLimited &&
+              err.code !== JsonRpcErrorCode.ServiceUnavailable &&
+              !(err instanceof UnexpectedOeisStatus))
+          ) {
+            throw err;
+          }
+          ctx.log.debug('OEIS optional b-file part unavailable', {
+            aNumber,
+            index,
+            code: err.code,
+          });
+          return partial();
+        }
+      }
+      ctx.signal.throwIfAborted();
+      // A replacement is already cached for the next call. Keep this call's original snapshot.
+      if ('read' in next) return partial();
+      const added = next.terms.filter(({ n }) => n >= nextIndex);
+      const nextPartMalformedLines = next.malformedLines;
+      if (next.headLost || (added.length ? added[0]?.n !== nextIndex : nextPartMalformedLines)) {
+        return partial(next);
+      }
+      pages.set(index, next);
+      const terms = added.length ? first.terms.concat(added) : first.terms;
+      return {
+        answer: {
+          ...this.pageRead(aNumber, read, paging, pages, served, skippedLine, terms),
+          ...(nextPartMalformedLines && { nextPartMalformedLines }),
+        },
+      };
+    };
     if (read.lastIndex === undefined || fromIndex === undefined || fromIndex <= read.lastIndex) {
       return answer(0);
     }
@@ -757,7 +826,8 @@ export class OeisService {
     pages: ReadonlyMap<number, BFilePage>,
     served: number | undefined,
     skippedLine: boolean,
-  ): BFileRead {
+    joinedTerms?: BFileTerm[],
+  ): BFileOk {
     let lastIndex: number | undefined;
     let reachedPage = -1;
     for (const [index, page] of pages) {
@@ -772,10 +842,11 @@ export class OeisService {
     const page = served === undefined ? undefined : pages.get(served);
     // Mark the served page recently used; the pages were gathered with peek.
     if (served !== undefined && served > 0) this.cache.get(pageKey(aNumber, served, paging.etag));
-    const last = page?.terms.at(-1);
+    const terms = joinedTerms ?? page?.terms ?? [];
+    const last = terms.at(-1);
     return {
       status: 'ok',
-      terms: page?.terms ?? [],
+      terms,
       ...(first.firstIndex !== undefined && { firstIndex: first.firstIndex }),
       ...(lastIndex !== undefined && { lastIndex }),
       ...(last && (cut || last.n !== lastIndex) && { nextIndex: last.n + 1 }),
@@ -803,7 +874,7 @@ export class OeisService {
   ): Promise<BFilePage | BFileHead> {
     const start = index * BFILE_PAGE_BYTES - BFILE_OVERLAP_BYTES;
     const end = Math.min((index + 1) * BFILE_PAGE_BYTES, paging.size) - 1;
-    const page = await this.call<BFilePage | BFileHead>(
+    const outcome = await this.call<Uint8Array | BFileHead>(
       'getBFilePage',
       bFileUrl(aNumber),
       [200, 206, 404],
@@ -817,7 +888,10 @@ export class OeisService {
         ) {
           // Not this page of the version page 0 came from: read page 0 again on the next call.
           await discard(res);
-          this.cache.delete(`bfile:${aNumber}`);
+          const cached = this.cache.peek(`bfile:${aNumber}`)?.value;
+          if (cached?.kind === 'bfile' && cached.head.paging === paging) {
+            this.cache.delete(`bfile:${aNumber}`);
+          }
           throw serviceUnavailable(
             'OEIS answered a b-file range request from another range or version of the file.',
             { reason: 'upstream_unparseable', retryable: false },
@@ -831,21 +905,23 @@ export class OeisService {
             { reason: 'upstream_unparseable' },
           );
         }
-        return parsePage(bytes, start, end === paging.size - 1);
+        return bytes;
       },
       ctx,
       deadlineMs,
     );
-    if ('read' in page) {
-      this.cacheHead(aNumber, page);
-    } else {
-      this.cache.set(
-        pageKey(aNumber, index, paging.etag),
-        { kind: 'bfile_page', page },
-        heapCharge(page),
-        this.now() + BFILE_TTL_MS,
-      );
+    ctx.signal.throwIfAborted();
+    if ('read' in outcome) {
+      this.cacheHead(aNumber, outcome);
+      return outcome;
     }
+    const page = parsePage(outcome, start, end === paging.size - 1);
+    this.cache.set(
+      pageKey(aNumber, index, paging.etag),
+      { kind: 'bfile_page', page },
+      heapCharge(page),
+      this.now() + BFILE_TTL_MS,
+    );
     return page;
   }
 
@@ -878,6 +954,8 @@ export class OeisService {
         context: ctx,
         signal: ctx.signal,
         deadlineMs,
+        // The attempt boundary classifies transport failures; an untyped throw is unexpected.
+        isTransient: (error) => error instanceof McpError && defaultIsTransient(error),
         maxRetries: 2,
         baseDelayMs: 2_000,
         maxDelayMs: 30_000,

@@ -124,7 +124,11 @@ const REFERENCE: Record<Topic, ReferenceTable> = {
       { name: 'comment:', description: 'Words in the comment lines.' },
       { name: 'ref:', description: 'Words in the reference lines.' },
       { name: 'link:', description: 'Words in the link lines.' },
-      { name: 'formula:', description: 'Text in the formula lines.' },
+      {
+        name: 'formula:',
+        description:
+          'Search formula text after the same normalization as quoted phrases; signs and operators do not distinguish matches. Confirm an expression with oeis_get_sequence and sections: ["formulas"].',
+      },
       { name: 'example:', description: 'Text in the example lines.' },
       { name: 'maple:', description: 'Text in the Maple programs.' },
       { name: 'mathematica:', description: 'Text in the Mathematica programs.' },
@@ -150,7 +154,8 @@ const REFERENCE: Record<Topic, ReferenceTable> = {
       { name: '~n', description: 'Exclude the number n from a space-separated list of numbers.' },
       {
         name: '"…"',
-        description: 'Match an exact phrase. Numbers quoted one by one match in any order.',
+        description:
+          'Match the normalized words and numbers in order; OEIS ignores punctuation and operators such as + - * ^. Numbers quoted one by one match in any order.',
       },
       { name: '_', description: 'One unknown term in a run of terms: 1,2,_,5,8,13.' },
       { name: '__', description: 'Any run of unknown terms inside a run of terms.' },

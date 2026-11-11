@@ -13,41 +13,10 @@ import type { BFileTerm } from '@/services/oeis/types.js';
 
 /** Most terms one call returns; a larger `limit` is served at this. */
 const MAX_TERMS = 1000;
-/** Most bytes one response carries: the `format()` text plus the structured JSON. */
-const RESPONSE_BUDGET_BYTES = 100_000;
-/** Held back from the budget for everything in a response except the term lines and objects. */
-const FIXED_RESERVE_BYTES = 4_000;
-const encoder = new TextEncoder();
-
-/** One term as `format()` renders it. */
-function termLine(term: BFileTerm): string {
-  return `a(${term.n}) = ${inline(term.value)}`;
-}
-
-/**
- * A term's share of a response: its rendered line and its JSON object, plus 3 for their separators
- * on the wire (the line's newline, 2 bytes once JSON-escaped, and the array comma).
- */
-function termBytes(term: BFileTerm): number {
-  return encoder.encode(termLine(term)).length + encoder.encode(JSON.stringify(term)).length + 3;
-}
-
-/** The leading terms of `window` that fit the response budget; always at least one. */
-function fitToBudget(window: BFileTerm[]): BFileTerm[] {
-  let spent = FIXED_RESERVE_BYTES;
-  let count = 0;
-  for (const term of window) {
-    spent += termBytes(term);
-    if (count > 0 && spent > RESPONSE_BUDGET_BYTES) break;
-    count++;
-  }
-  return window.slice(0, count);
-}
-
 export const oeisGetTerms = tool('oeis_get_terms', {
   title: 'Get OEIS Sequence Terms',
   description:
-    "List terms a(n) of a sequence with their indices n. Reads the entry's b-file when it has one — often thousands of terms beyond the data line — and otherwise the data line itself. Values are exact decimal strings of any size. A slice stops at limit terms (at most 1000 per call), at about 100,000 bytes, or at the end of one 1 MiB part of a larger b-file, whichever comes first; nextFromIndex continues it.",
+    "List terms a(n) of a sequence with their indices n. Reads the entry's b-file when it has one — often thousands of terms beyond the data line — and otherwise the data line itself. Values are exact decimal strings of any size. A slice returns up to limit terms (at most 1000 per call) and may read the next b-file part to fill it. Pass nextFromIndex to continue.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     aNumber: ANumberSchema,
@@ -55,7 +24,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       'First index n to return; defaults to the first available index. Pass nextFromIndex from the previous call to continue.',
     ),
     limit: blankAsUnset(z.number().int().min(1).default(100)).describe(
-      'Maximum number of terms to return (default 100). One call returns at most 1000, so a larger limit is served as 1000. A slice stops sooner at about 100,000 bytes of large terms or at the end of one 1 MiB part of a larger b-file; continue with nextFromIndex.',
+      'Maximum number of terms to return (default 100). One call returns at most 1000, so a larger limit is served as 1000. A slice can end early when fewer terms are available to this call. Pass nextFromIndex to continue.',
     ),
   }),
   output: z.object({
@@ -85,7 +54,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       .number()
       .optional()
       .describe(
-        'Highest index n read so far for this entry; when bFileCut is true the b-file goes on past it. Absent when no terms were read.',
+        'Highest index n read so far for this entry; when bFileCut is true the b-file may contain terms beyond it. Absent when no terms were read.',
       ),
     nextFromIndex: z
       .number()
@@ -104,7 +73,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
     bFileCut: z
       .boolean()
       .describe(
-        'True while the b-file goes on past lastAvailableIndex. Its later terms are at bFileUrl; nextFromIndex or a larger fromIndex reaches them unless the notice says only the first 1 MiB was read.',
+        'True when the b-file may contain terms beyond lastAvailableIndex. Follow nextFromIndex or the notice to check, or consult bFileUrl.',
       ),
     url: z.string().describe('Sequence page on oeis.org; cite it wherever the terms are reused.'),
   }),
@@ -116,7 +85,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       .string()
       .optional()
       .describe(
-        'Guidance: where the next slice starts and whether the byte budget ended this one, why no terms came back (past the last index, or not yet reached in a large b-file), that a b-file line too long to read was skipped, how many lines of the b-file part this slice comes from are not n a(n) pairs and were skipped, that only the first 1 MiB of the b-file could be read, or that the terms are data-line only.',
+        'Guidance on continuing the slice, a short or empty slice, skipped b-file lines, the b-file read bounds, or data-line-only terms.',
       ),
   },
   errors: [
@@ -161,14 +130,14 @@ export const oeisGetTerms = tool('oeis_get_terms', {
     const { aNumber, fromIndex } = input;
     const service = getOeisService();
     const startedAt = Date.now();
-    /** What is left of the call's one deadline, for each request after the first. */
+    /** Time left on the deadline shared by all upstream reads. */
     const remainingMs = () => Math.max(0, DEFAULT_DEADLINE_MS - (Date.now() - startedAt));
 
     const cached = service.getCachedRecord(aNumber);
     const knownWithoutBFile = cached !== undefined && !cached.bFileUrl;
     const bFile = knownWithoutBFile
       ? undefined
-      : await service.getBFile(aNumber, ctx, { fromIndex });
+      : await service.getBFile(aNumber, ctx, { fromIndex, limit, deadlineMs: remainingMs() });
 
     let read = bFile?.status === 'ok' ? bFile : undefined;
     let dataLine: BFileTerm[] = [];
@@ -181,6 +150,7 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       if (bFile?.status === 'missing' && record.bFileUrl) {
         const again = await service.getBFile(aNumber, ctx, {
           fromIndex,
+          limit,
           deadlineMs: remainingMs(),
         });
         if (again.status === 'ok') read = again;
@@ -199,10 +169,10 @@ export const oeisGetTerms = tool('oeis_get_terms', {
 
     const found = fromIndex === undefined ? 0 : terms.findIndex((term) => term.n >= fromIndex);
     const begin = found === -1 ? terms.length : found;
-    const window = terms.slice(begin, begin + limit);
-    const slice = fitToBudget(window);
+    const slice = terms.slice(begin, begin + limit);
+    const nextTerm = terms[begin + slice.length];
     // A slice that reaches the end of a b-file page continues in the next page.
-    const next = terms[begin + slice.length]?.n ?? (slice.length > 0 ? read?.nextIndex : undefined);
+    const next = nextTerm?.n ?? (slice.length > 0 ? read?.nextIndex : undefined);
     ctx.enrich({ shown: slice.length });
 
     const notices: string[] = [];
@@ -243,11 +213,24 @@ export const oeisGetTerms = tool('oeis_get_terms', {
     if (source === 'data') {
       notices.push('This entry has no b-file; these are the data-line terms only.');
     }
+    if (read?.nextPartMalformedLines) {
+      const count = read.nextPartMalformedLines;
+      notices.push(
+        count === 1
+          ? `The next b-file part has 1 line that is not an n a(n) pair. It was skipped; the file is at ${bFileUrl(aNumber)}.`
+          : `The next b-file part has ${count} lines that are not n a(n) pairs. They were skipped; the file is at ${bFileUrl(aNumber)}.`,
+      );
+    }
+    if (read?.nextPartSkippedLine) {
+      notices.push(
+        `A b-file line at the next part boundary is longer than the 4 KiB overlap and could not be read whole. The file is at ${bFileUrl(aNumber)}.`,
+      );
+    }
     if (next !== undefined) {
       let continuation = `More terms follow; call again with fromIndex ${next}.`;
-      if (slice.length < window.length) {
-        continuation = `Stopped after ${slice.length} ${slice.length === 1 ? 'term' : 'terms'} to stay within the 100,000-byte response budget; call again with fromIndex ${next}.`;
-      } else if (input.limit > limit && terms[begin + slice.length] !== undefined) {
+      if (read?.nextPartUnavailable) {
+        continuation = `The next b-file part could not extend this slice; call again with fromIndex ${next}.`;
+      } else if (input.limit > limit && nextTerm !== undefined) {
         // The per-call cap, not the caller's limit, ended a slice whose page goes on.
         continuation = `Stopped after ${limit} terms, the most one call returns (limit was ${input.limit}); call again with fromIndex ${next}.`;
       }
@@ -291,12 +274,14 @@ export const oeisGetTerms = tool('oeis_get_terms', {
       lines.push(`**b-file size:** ${result.bFileSizeInBytes} bytes`);
     }
     lines.push(
-      `**b-file continues past the last available index:** ${result.bFileCut ? 'yes, later terms exist at the b-file URL' : 'no'}`,
+      `**b-file may contain later terms:** ${result.bFileCut ? 'yes, see the b-file URL' : 'no'}`,
       `**URL:** ${result.url}`,
       '',
       '## Terms',
       '',
-      result.terms.length ? result.terms.map(termLine).join('\n') : 'None in this slice.',
+      result.terms.length
+        ? result.terms.map(({ n, value }) => `a(${n}) = ${inline(value)}`).join('\n')
+        : 'None in this slice.',
     );
     if (result.nextFromIndex !== undefined) {
       lines.push('', `**Next slice:** call again with fromIndex ${result.nextFromIndex}.`);

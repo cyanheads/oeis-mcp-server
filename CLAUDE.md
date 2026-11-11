@@ -2,9 +2,9 @@
 
 **Server:** oeis-mcp-server
 **Version:** 0.1.3
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -15,24 +15,26 @@
 
 ## Domain
 
-Six read-only tools and one resource over oeis.org, the On-Line Encyclopedia of Integer Sequences. Keyless; OEIS content is CC BY-SA 4.0.
+Six read-only tools and one sequence resource over oeis.org, the On-Line Encyclopedia of Integer Sequences, plus the published `oeis-guide` skill at `skill://oeis-guide/SKILL.md`. Keyless; OEIS content is CC BY-SA 4.0.
 
 | Upstream path | Format | Used by |
 |:--------------|:-------|:--------|
 | `/A######?fmt=json` | One record as JSON | `oeis_get_sequence`, `oeis://sequence/{aNumber}`, `oeis_get_cross_refs` outgoing, `oeis_get_terms` when the entry has no b-file |
 | `/search?q=…&fmt=text` | Internal format, 10 records per page | `oeis_identify_sequence`, `oeis_search_sequences`, `oeis_get_cross_refs` (outgoing names, incoming) |
-| `/A######/b######.txt` | b-file, read in 1 MiB pages: the first always, a later one by byte range with `If-Range` when `fromIndex` lies past the first | `oeis_get_terms` |
+| `/A######/b######.txt` | b-file in 1 MiB parts: the first part, up to two parts to seek to `fromIndex`, and one optional adjacent part to fill a slice. Later requests use `If-Range`. | `oeis_get_terms` |
 
 `oeis_list_reference` serves static tables and makes no upstream call. There are no prompts.
 
 `OeisService` (`src/services/oeis/oeis-service.ts`) owns every upstream request: one process-wide pacer (`minStartGapMs: 10_000`, `maxConcurrent: 1`, a cooldown after a `429`), a `withRetry` boundary with a 50 s per-call deadline, per-path accept-list fetch boundaries with `redirect: 'manual'`, and a 64 MiB in-process LRU (records 24 h, or until a freshly fetched search row shows a later edit, then revalidated with `If-Modified-Since`; a record `404` 1 h, or until such a row lists the A-number; search pages 1 h; b-file pages 7 days, later pages keyed by the first page's ETag). The cache is process-global rather than `ctx.state` on purpose: the data is public and identical for every tenant. `OEIS_QUEUE_MAX_WAIT_MS` is the only server-specific env var; the 10 s pace is oeis.org's rule and is not configurable.
+
+The terms slice follows `min(limit, 1000)`, regardless of digit count. A short slice can join the next part when the first new index follows the last returned index and the ETag matches. All reads share the call deadline. An unavailable optional read keeps the partial slice and continuation cursor. Required read failures and caller cancellation propagate.
 
 Conventions every definition follows:
 
 - **Every oeis.org request goes through `OeisService`.** Never `fetch` from a handler: pacing, retries, caching, and error classification live in the service.
 - **Shared inputs.** A-numbers use `ANumberSchema` from `src/mcp-server/shared/oeis-schemas.ts`; every optional or defaulted input is wrapped in `blankAsUnset`; paging uses `pageStartSchema` (`start` 0–100 in steps of 10, since OEIS shows anonymous callers at most 110 results).
 - **Terms are decimal strings**, never JSON numbers; values routinely pass 2^53.
-- **Upstream text is data.** Names, authors, comments, formulas, examples, programs, references, cross-references, extensions, link text, and cross-reference notes are contributor-written: render them in `format()` as code, through `codeSpan()` in an inline slot (heading, bold label, list item) or `fence()` for line sections, from `src/mcp-server/shared/markdown.ts`, and link URLs through `codeSpan()`, never as markdown link targets. Code shows every character as written, where an escape scheme would put backslashes into formulas. Upstream tokens (terms, offset, keywords, legacy IDs, dates, program languages, the b-file URL) and server-written reference text go through `inline()`, which flattens line breaks and escapes link, image, link-definition, and HTML openers; `structuredContent` keeps every string as normalized.
+- **Upstream text is data.** Names, authors, comments, formulas, examples, program language tags and code, references, cross-references, extensions, link text, and cross-reference notes are contributor-written: render them in `format()` as code, through `codeSpan()` in an inline slot (heading, bold label, list item) or `fence()` for line sections, from `src/mcp-server/shared/markdown.ts`, and link URLs through `codeSpan()`, never as markdown link targets. Code shows every character as written, where an escape scheme would put backslashes into formulas. Upstream tokens (terms, offset, keywords, legacy IDs, dates, the b-file URL) and server-written reference text go through `inline()`, which flattens line breaks and escapes link, image, link-definition, and HTML openers; `structuredContent` keeps every string as normalized.
 - **Attribution.** Every record and summary row carries its `https://oeis.org/A######` `url`; keep it on any new output shape.
 - **No fabrication.** A field OEIS leaves out stays absent: `offset` on a reserved or recycled A-number and `author` on its summary row, `modified` and `legacyIds` on a row whose `%I` line is missing or unreadable, `matchStartIndex` when the run is not in the data line, the name and terms of an unresolved cross-reference row.
 - **Errors.** Each definition declares `pacer_shed` and `upstream_rate_limited` (`RateLimited`, `thrownBy: 'service'`) with a recovery naming that tool. `sequence_not_found` is thrown by the handler through `ctx.fail` when `getRecord` returns `undefined`, never by the service.
@@ -48,6 +50,7 @@ When the user asks what's next or needs direction, suggest options based on the 
 3. **Add tools/resources/prompts** — scaffold new definitions using the `add-tool`, `add-app-tool`, `add-resource`, `add-prompt` skills
 4. **Add services** — scaffold domain service integrations using the `add-service` skill
 5. **Add tests** — scaffold tests for existing definitions using the `add-test` skill
+   - **Publish an agent skill** when a reusable tool workflow earns one. Use `add-skill` to author and verify it.
 6. **Field-test definitions** — exercise tools/resources/prompts with real inputs using the `field-test` skill, get a report of issues and pain points
 7. **Run `devcheck`** — lint, format, typecheck, and security audit
 8. **Run the `security-pass` skill** — audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation
@@ -380,7 +383,7 @@ docs/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Development skills live in `framework-skills/`. Read the matching skill directly and run `bun run list-skills` for the registry. Root `skills/` is reserved for skills that teach clients how to use the server's tools. Plugin hosts discover them there, and MCP clients can access them when the server enables `createApp({ skills: 'skills' })`. Use `add-skill` and validate the tree with `bun run lint:packaging`.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -394,6 +397,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author and verify a skill the server publishes to its users' agents |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -462,7 +466,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` builds a stdio `.mcpb` bundle for Claude Desktop. `mcpb pack` reads `.mcpbignore`, so add a root-anchored entry for each new development path (such as `/docs/`). Root `skills/` ships with the bundle. `scripts/clean-mcpb.ts` prunes dev dependencies, dependency-shipped agent docs, platform-specific native bindings, node-gyp build output, and build-only package files. Runtime SDK modules inside a dependency's nested `skills/` directory stay in the bundle.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

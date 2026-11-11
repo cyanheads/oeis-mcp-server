@@ -31,10 +31,14 @@ export function likelyPastDataLine(terms: readonly string[]): boolean {
       return value < 0n ? -value : value;
     })
     .filter((value) => value !== 0n);
-  const low = magnitudes.reduce((a, b) => (b < a ? b : a), magnitudes[0] ?? 0n);
-  const high = magnitudes.reduce((a, b) => (b > a ? b : a), 0n);
+  let low = magnitudes[0] ?? 0n;
+  let high = 0n;
+  for (const value of magnitudes) {
+    if (value < low) low = value;
+    if (value > high) high = value;
+  }
   return (
-    (magnitudes.length > 0 && magnitudes.every((value) => value >= LARGE_TERM)) ||
+    low >= LARGE_TERM ||
     (terms.length >= 5 &&
       magnitudes.length === terms.length &&
       low >= SLOW_TERM &&

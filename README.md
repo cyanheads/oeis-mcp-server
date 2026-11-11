@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/oeis-mcp-server</h1>
   <p><b>Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs via MCP. STDIO or Streamable HTTP.</b>
-  <div>6 Tools • 1 Resource</div>
+  <div>6 Tools • 1 Sequence Resource • 1 Skill</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oeis-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oeis-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oeis-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oeis-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oeis-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oeis-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -50,6 +50,10 @@ Integer sequences from the [On-Line Encyclopedia of Integer Sequences](https://o
 
 The same record is available through `oeis_get_sequence` for clients that only call tools.
 
+### Skill
+
+The [OEIS guide](./skills/oeis-guide/SKILL.md) covers candidate verification, formula matching, and partial-result coverage. Plugin installs include it; MCP clients can read `skill://oeis-guide/SKILL.md`.
+
 ## Capability reference
 
 ### `oeis_identify_sequence` <sub>tool</sub>
@@ -81,10 +85,11 @@ The same record is available through `oeis_get_sequence` for clients that only c
 
 ### `oeis_get_terms` <sub>tool</sub>
 
-- `fromIndex` (default: the first available index) and `limit` (default 100; one call returns at most 1,000 terms, so a larger `limit` is served as 1,000); a slice also stops at about 100,000 bytes or at the end of a 1 MiB part of the b-file, and `nextFromIndex` continues it
-- `source: "bfile"` reads the entry's b-file in 1 MiB parts, so a `fromIndex` past the first 1 MiB costs one or two more paced requests; `bFileCut: true` means the file goes on past `lastAvailableIndex`. `source: "data"` means the entry has no b-file and the terms are its data line
+- `fromIndex` defaults to the first available index. `limit` defaults to 100 and applies up to 1,000 terms per call, regardless of digit count. Pass `nextFromIndex` to continue.
+- `source: "bfile"` reads the entry’s b-file in 1 MiB parts. The tool can seek up to two parts beyond the first and read one adjacent part to fill the slice. It joins adjacent terms only when their indices continue and the ETag matches. If the optional part is unavailable, the tool returns the terms it has with a continuation cursor. `bFileCut: true` means the file may contain terms beyond `lastAvailableIndex`. `source: "data"` means the entry has no b-file and the terms are its data line.
 - Terms come back as `{ n, value }`, `value` an exact decimal string; an unknown A-number fails as `sequence_not_found`
 - A b-file line that is not blank, a `#` comment, or an `n a(n)` pair is skipped, and the `notice` says how many; a b-file that holds no pair at all fails as `upstream_unparseable` and is not cached
+- If a line at a part boundary exceeds the 4 KiB overlap and cannot be read whole, the notice points to the b-file.
 
 ---
 
@@ -138,7 +143,7 @@ A call with nothing cached waits its turn in the queue. When the wait would pass
 - A query OEIS judges too broad returns no rows ("Too many results"), which is common for a single word (`prime`) or a two-term run. The server reports it but cannot page it.
 - OEIS searches an unknown prefix as plain words instead of rejecting it; the zero-hit notice names it.
 - Term matching (`oeis_identify_sequence`, and an `oeis_search_sequences` query of bare numbers or `seq:` / `signed:` terms) searches each entry's data line only, not b-files, and data lines are short: at most 269 characters, signs included, across 105 measured (2026-10-01). A run that starts beyond the data line, or one longer than about 270 characters, is not found.
-- `oeis_get_terms` reads at most two 1 MiB parts of a b-file past the first per call; an index deeper in comes back with a notice to call again, which continues from the parts already cached. A b-file served without byte ranges or a strong `ETag` is read only to its first 1 MiB.
+- `oeis_get_terms` shares a 50 s deadline across its reads. If two seek reads do not reach the requested index, call again to continue from cached parts. Failures on required reads and caller cancellation propagate. A b-file served without byte ranges or a strong `ETag` is read only to its first 1 MiB.
 - `oeis_get_cross_refs` outgoing shares the `start` ≤ 100 bound, so an entry naming more than 110 distinct A-numbers lists only the first 110; `lines` still names them all.
 
 ## Data and licensing
@@ -227,7 +232,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - No API key or account: the server reads public oeis.org data.
 
 ### Installation
@@ -266,6 +271,8 @@ cp .env.example .env
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto`. | `stateless` |
 | `MCP_AUTH_MODE` | Authentication: `none`, `jwt`, or `oauth`. | `none` |
+| `MCP_JWT_EXPECTED_AUDIENCE` | Audience claim required in JWT mode. The server warns at startup when JWT mode is configured without an audience. | unset |
+| `MCP_JWT_EXPECTED_ISSUER` | Issuer claim required in JWT mode. Set it alongside the expected audience. | unset |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `warning`, `error`, etc.). | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<app-root>/logs` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend: `in-memory`, `filesystem`, `supabase`, `cloudflare-kv/r2/d1`. | `in-memory` |
@@ -305,6 +312,7 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
 | `src/mcp-server/resources` | Resource definitions. The `oeis://sequence/{aNumber}` resource. |
 | `src/mcp-server/shared` | Schemas shared across definitions (A-number input, paging, summary rows), Markdown helpers for contributor-written text, and the data-line-limit test and sentence the term-matching zero-hit notices share. |
 | `src/services/oeis` | oeis.org client: pacer, retries, fetch boundaries, LRU cache, record normalization, and the internal-format parser. |
+| `skills/` | Published OEIS guide, included in npm, Docker, and MCPB and served over MCP. |
 | `tests/` | Unit tests mirroring the `src/` structure; upstream responses come from fixtures, never the live site. |
 
 ## Development guide

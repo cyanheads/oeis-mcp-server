@@ -77,7 +77,7 @@ function longestBacktickRun(text: string): number {
 
 /**
  * Renders an upstream token or server-written text for an inline slot (keywords, offset, legacy
- * IDs, dates, terms, program languages, reference tables): line breaks flattened to a space, then
+ * IDs, dates, terms, reference tables): line breaks flattened to a space, then
  * link, image, and HTML syntax escaped. Contributor-written text goes through {@link codeSpan} instead.
  */
 export function inline(text: string): string {

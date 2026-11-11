@@ -140,7 +140,7 @@ export interface BFileTerm {
 
 /**
  * Result of reading a b-file. A file is read in pages of up to 1 MiB: the first page (bytes 0 to
- * 1 MiB − 1) on every call, and a later page only when `fromIndex` lies past the first.
+ * 1 MiB − 1), up to two pages to seek to `fromIndex`, and one adjacent page to fill a short slice.
  */
 export type BFileRead =
   | {
@@ -160,6 +160,12 @@ export type BFileRead =
        * `n a(n)` pair; they were skipped. Absent when there are none.
        */
       malformedLines?: number;
+      /** Malformed lines in the adjacent part consulted to fill the slice. */
+      nextPartMalformedLines?: number;
+      /** A line could not be read whole across the next part's 4 KiB overlap. */
+      nextPartSkippedLine?: true;
+      /** The optional adjacent read could not supply a safe continuation. */
+      nextPartUnavailable?: true;
       /** The n to ask for next when the file goes on past the last pair of `terms`. */
       nextIndex?: number;
       /** Total file size when upstream stated it (`Content-Range` total or `Content-Length`). */
@@ -171,7 +177,8 @@ export type BFileRead =
       skippedLine?: true;
       status: 'ok';
       /**
-       * Pairs of the page holding `fromIndex` (the first page when it is unset), in file order;
+       * Pairs of the page holding `fromIndex` (the first page when it is unset), optionally
+       * followed by pairs from the adjacent part in the same version, in file order;
        * blank lines, `#` comments, and malformed lines skipped. Empty when `unreached`.
        */
       terms: BFileTerm[];
@@ -194,4 +201,6 @@ export interface UpstreamCallOptions {
 export interface BFileOptions extends UpstreamCallOptions {
   /** The n the caller starts from; a file larger than 1 MiB is read at the page that holds it. */
   fromIndex?: number | undefined;
+  /** Fill up to this many terms starting at fromIndex, if the adjacent part can be joined. */
+  limit?: number;
 }

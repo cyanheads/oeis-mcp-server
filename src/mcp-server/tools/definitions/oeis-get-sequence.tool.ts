@@ -21,8 +21,8 @@ import { SECTION_NAMES, type SectionName, type SequenceRecord } from '@/services
 const OUTLINE_BUDGET_CHARS = 24_000;
 
 /**
- * Most bytes one response to a sections selection carries, as oeis_get_terms counts its slices:
- * the structuredContent JSON (the notice included) plus the content[] text, UTF-8.
+ * Most bytes one response to a sections selection carries: the structuredContent JSON
+ * (the notice included) plus the content[] text, UTF-8.
  */
 const RESPONSE_BUDGET_BYTES = 100_000;
 const encoder = new TextEncoder();
@@ -355,7 +355,7 @@ function formatSequence(result: SequenceOutput) {
   if (result.programs) {
     const programBlocks = result.programs.map(
       (program) =>
-        `### ${program.language ? inline(program.language) : 'Untagged'}\n\n${fence(program.code)}`,
+        `### ${program.language ? codeSpan(program.language) : 'Untagged'}\n\n${fence(program.code)}`,
     );
     blocks.push(
       ['## Programs', ...(programBlocks.length ? programBlocks : ['None.'])].join('\n\n'),

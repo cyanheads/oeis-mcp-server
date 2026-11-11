@@ -1177,9 +1177,9 @@ describe('oeis_get_sequence', () => {
       );
       expect(text).toContain('## Examples\n\n```\nF(5) = 5 = F(4) + F(3) = 3 + 2.\n```');
       expect(text).toContain(
-        '### Python\n\n```\nfrom sympy import fibonacci\ndef a(n): return fibonacci(n)\n```',
+        '### `Python`\n\n```\nfrom sympy import fibonacci\ndef a(n): return fibonacci(n)\n```',
       );
-      expect(text).toContain('### PARI\n\n```\na(n) = fibonacci(n)\n```');
+      expect(text).toContain('### `PARI`\n\n```\na(n) = fibonacci(n)\n```');
     });
 
     it('keeps CR/LF in upstream text out of inline slots, so injected headings stay inert', async () => {
@@ -1221,10 +1221,10 @@ describe('oeis_get_sequence', () => {
         '## Formulas',
         '## Examples',
         '## Programs',
-        '### Maple',
-        '### Mathematica',
-        '### PARI',
-        '### Python',
+        '### `Maple`',
+        '### `Mathematica`',
+        '### `PARI`',
+        '### `Python`',
         '## References',
         '## Links',
         '## Cross-references',
@@ -1377,6 +1377,61 @@ describe('oeis_get_sequence', () => {
     /** The tool's own headings: the entry heading, a section heading, or a program language. */
     const OWN_HEADING = new RegExp(
       `^(h1 A\\d{6}: .*|h2 (${Object.values(HEADINGS).join('|')})|h3 .*)$`,
+    );
+
+    it('preserves ordinary language labels and the untagged program heading', async () => {
+      const raw = recordWith(
+        {
+          program: [
+            'a(n)=n',
+            '(C#) a(n)=n',
+            '(F#) a(n)=n',
+            '(Python 3) a(n)=n',
+            '(PARI/GP) a(n)=n',
+          ],
+        },
+        minimalRecordJson,
+      );
+      const { result } = await fetchSequence(
+        { aNumber: 'A388000', sections: ['programs'] },
+        ok(raw),
+      );
+      expect(structured(result).programs).toEqual([
+        { code: 'a(n)=n' },
+        { language: 'C#', code: 'a(n)=n' },
+        { language: 'F#', code: 'a(n)=n' },
+        { language: 'Python 3', code: 'a(n)=n' },
+        { language: 'PARI/GP', code: 'a(n)=n' },
+      ]);
+      expect(headings(render(textOf(result)).html)).toEqual([
+        'h1 A388000: Synthetic new entry.',
+        'h2 Programs',
+        'h3 Untagged',
+        'h3 C#',
+        'h3 F#',
+        'h3 Python 3',
+        'h3 PARI/GP',
+      ]);
+    });
+
+    it.each(['PARI _x_ #', 'C# _label_', 'Python 3 #'])(
+      'renders the program tag %s literally on both surfaces',
+      async (language) => {
+        const raw = recordWith({ program: [`(${language}) a(n)=n`] }, minimalRecordJson);
+        const { result } = await fetchSequence(
+          { aNumber: 'A388000', sections: ['programs'] },
+          ok(raw),
+        );
+        expect(structured(result).programs).toEqual([{ language, code: 'a(n)=n' }]);
+        const { html } = render(textOf(result));
+        expect(headings(html)).toEqual([
+          'h1 A388000: Synthetic new entry.',
+          'h2 Programs',
+          `h3 ${language}`,
+        ]);
+        expect(codeTexts(html)).toContain('a(n)=n\n');
+        expect(elements(html, 'em')).toEqual([]);
+      },
     );
 
     it('renders every A000108 formula verbatim, with no emphasis or strikethrough', async () => {

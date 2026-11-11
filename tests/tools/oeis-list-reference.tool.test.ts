@@ -8,6 +8,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it, vi } from 'vitest';
 import { oeisListReference } from '@/mcp-server/tools/definitions/oeis-list-reference.tool.js';
+import { render } from '../fixtures/rendered-markdown.js';
 import { blocksText } from '../fixtures/tool-service.js';
 
 vi.mock('@/services/oeis/oeis-service.js', async (importOriginal) => ({
@@ -105,6 +106,21 @@ describe('oeis_list_reference', () => {
       expect(names).toEqual(expect.arrayContaining(['seq:', 'signed:', 'id:', 'paging']));
       const paging = table.entries.find((entry) => entry.name === 'paging');
       expect(paging?.description).toContain('110');
+    });
+
+    it('explains normalized phrase matching and how to verify a formula', async () => {
+      const { table, text } = await lookup('search_syntax');
+      const phrase = table.entries.find((entry) => entry.name === '"…"');
+      const formula = table.entries.find((entry) => entry.name === 'formula:');
+      expect(phrase?.description).toContain('normalized words and numbers in order');
+      expect(phrase?.description).toContain('+ - * ^');
+      expect(phrase?.description).toContain('Numbers quoted one by one match in any order.');
+      expect(formula?.description).toContain('signs and operators do not distinguish matches');
+      expect(formula?.description).toContain('oeis_get_sequence');
+      expect(formula?.description).toContain('sections: ["formulas"]');
+      const shown = render(text).text;
+      expect(shown).toContain(phrase?.description);
+      expect(shown).toContain(formula?.description);
     });
 
     it('covers A-numbers, legacy M/N numbers, offsets, and b-files', async () => {
