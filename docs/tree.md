@@ -1,6 +1,6 @@
 # oeis-mcp-server - Directory Structure
 
-Generated on: 2026-11-11 05:33:44
+Generated on: 2026-11-11 05:46:11
 
 ```text
 oeis-mcp-server/
@@ -25,6 +25,7 @@ oeis-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
