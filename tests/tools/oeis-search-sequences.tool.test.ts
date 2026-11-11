@@ -866,7 +866,7 @@ describe('oeis_search_sequences', () => {
       expect(text).toContain('**shown:** 2');
       expect(text).toContain('**cap:** 10');
       expect(text).toContain('**26 total**');
-      expect(text).toContain('Query: seq:1,2,5,14,42,132,429');
+      expect(render(text).text).toContain('Query: seq:1,2,5,14,42,132,429');
     });
   });
 
