@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: oeis-mcp-server
+abstract: "Identify integer sequences by terms, search the OEIS, read formulas, programs, b-files, cross-refs via MCP. STDIO or Streamable HTTP."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/oeis-mcp-server"
+license: Apache-2.0
+doi: 10.5281/zenodo.24193017
+keywords:
+  - mcp
+  - model-context-protocol
+  - oeis
+  - integer-sequences
+  - sequence-identification
+  - mathematics
+  - number-theory
+  - combinatorics
